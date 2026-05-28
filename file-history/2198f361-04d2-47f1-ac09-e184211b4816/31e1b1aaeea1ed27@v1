@@ -1,0 +1,64 @@
+import json
+from typing import Any
+
+from aws_lambda_powertools import Logger
+from aws_lambda_powertools.tracing import Tracer
+from aws_lambda_powertools.utilities.typing import LambdaContext
+from dotenv import load_dotenv
+
+from dns_de_rte_orchestrator.audit_logging import (
+    FallbackAuditLogReader,
+    get_audit_log_reader,
+)
+
+# Load .env file, mostly useful for testing
+_ = load_dotenv()
+
+logger = Logger()
+tracer = Tracer()  # Sets service via POWERTOOLS_SERVICE_NAME env var
+
+reader: FallbackAuditLogReader = get_audit_log_reader()
+
+
+def _response(
+    status_code: int,
+    body: dict[str, Any],
+) -> dict[str, object]:
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(body),
+    }
+
+
+@tracer.capture_lambda_handler
+@logger.inject_lambda_context
+def lambda_handler(
+    event: dict[str, object],
+    _context: LambdaContext,
+) -> dict[str, object]:
+    """Entrypoint for AWS Lambda that retrieves the audit log for an erasure id."""
+    path_parameters = event.get("pathParameters") or {}
+    erasure_id: object = (
+        path_parameters.get("id") if isinstance(path_parameters, dict) else None
+    )
+
+    if not isinstance(erasure_id, str) or not erasure_id.strip():
+        return _response(400, {"error": "missing erasure id"})
+
+    try:
+        entries = reader.get_logs(erasure_id)
+    except Exception:
+        logger.exception("Failed to retrieve audit log for %s", erasure_id)
+        return _response(500, {"error": "internal error"})
+
+    if not entries:
+        return _response(404, {"error": "no audit log found", "id": erasure_id})
+
+    return _response(
+        200,
+        {
+            "id": erasure_id,
+            "entries": [entry.to_json() for entry in entries],
+        },
+    )

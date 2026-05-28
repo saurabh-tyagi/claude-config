@@ -1,0 +1,51 @@
+# Plan: Reply to MR !49 review threads
+
+## Context
+The code changes for MR !49 review feedback have been pushed (commit `5771e38`). Now each of LyndonHB's 5 inline review threads needs a reply explaining what changed (or why it didn't change), so the reviewer can resolve them.
+
+## Approach
+Use `glab api` to POST a new note to each discussion. The endpoint is:
+```
+POST /projects/HnBI%2Fdns%2Fdns-de-rte-orchestrator/merge_requests/49/discussions/<discussion_id>/notes
+```
+with `body=<reply text>` as the form field.
+
+## Replies
+
+### Thread 1 — `tests/conftest.py:5` (discussion `3fdf60...`)
+> "Can't you do similar in test_creator_lambda.py rather than for all the tests?"
+
+Reply:
+> Good call — done. `tests/conftest.py` is removed and the env-var setup now lives at the top of `tests/test_creator_lambda.py` (before the `creator_lambda` import). It can't be a fixture because `creator_lambda` calls `get_request_repository()` at module-import time, so the env var must be set before the import statement runs. Comment in the file explains this.
+
+### Thread 2 — `template.yaml:83` (discussion `596c5f...`)
+> "I don't think it would fully constitute a GDPR violation..."
+
+Reply:
+> Agreed — comment is reworded to drop the legal framing. It now reads as a guideline that PII in `erasure_details` should not be persisted in CloudWatch logs.
+
+### Thread 3 — `template.yaml:57` (discussion `9bc7f4...`)
+> "Should we not be forcing OneTrust to use some kind of token?"
+
+Reply:
+> Added API key auth. `ApiKeyRequired: true` is set both at the API level and on the `CreateErasureRequest` event. New `CreateRequestApiKey`, `CreateRequestUsagePlan`, and `CreateRequestUsagePlanKey` resources wire it up. The key ID is exposed via the `CreateRequestApiKeyId` stack output; operators retrieve the actual key value from the API Gateway console. OneTrust will need to send it in the `x-api-key` header.
+
+### Thread 4 — `samconfig.toml:56` (discussion `7ca56a...`)
+> "Is the hard coded VPC Endpoint the correct way to do this?"
+
+Reply:
+> No — switched to SSM resolution. Both `dev` and `prod` now use `VPCEndpointId={{resolve:ssm:/dns/de/rte-orchestrator/prod/vpce-id}}`, so the value is read from SSM Parameter Store at deploy time rather than baked into the repo. The SSM parameter needs to exist in the account before the next deploy (initial value: `vpce-0ccf7efad71b28b54`).
+
+### Thread 5 — `creator_lambda.py:34` (discussion `c746d3...`)
+> "Is this an arbitrary length? Could names/addresses exceed it?"
+
+Reply:
+> 512 is a safe upper bound for all current fields: RFC 5321 caps email at 254 chars, postcodes are far shorter, and full names rarely exceed 100. If we ever need to accept a field that legitimately runs longer, we'd lift the per-field cap or add a per-field override.
+
+## Files to edit
+None (code already committed). Plan is purely about posting GitLab discussion replies via `glab api`.
+
+## Verification
+After posting:
+- `glab api projects/HnBI%2Fdns%2Fdns-de-rte-orchestrator/merge_requests/49/discussions` to confirm each thread now has a reply note from us.
+- Visually inspect MR !49 in the GitLab UI to ensure each thread is unresolved but has the new reply.

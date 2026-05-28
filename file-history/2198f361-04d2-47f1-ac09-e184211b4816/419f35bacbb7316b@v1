@@ -1,0 +1,142 @@
+import json
+import os
+from datetime import datetime, timezone
+from unittest.mock import MagicMock
+
+from dns_de_rte_orchestrator.audit_logging import (
+    AUDIT_LOG_S3_BUCKET,
+    AUDIT_LOG_S3_PREFIX,
+    DYNAMO_DB_AUDIT_LOGGING_TABLE,
+)
+from dns_de_rte_orchestrator.request_repository import REPOSITORY_TYPE_ENV_VAR
+
+# Set required env vars before reporter_lambda is imported — its module-level
+# get_audit_log_reader() call needs these to be present at import time.
+_ = os.environ.setdefault(DYNAMO_DB_AUDIT_LOGGING_TABLE, "test-audit-table")
+_ = os.environ.setdefault(AUDIT_LOG_S3_BUCKET, "test-bucket")
+_ = os.environ.setdefault(AUDIT_LOG_S3_PREFIX, "test-prefix")
+_ = os.environ.setdefault(REPOSITORY_TYPE_ENV_VAR, "memory")
+
+
+import dns_de_rte_orchestrator.reporter_lambda as reporter_module  # noqa: E402
+from dns_de_rte_orchestrator.audit_logging import (
+    AuditEntry,
+    FallbackAuditLogReader,
+)  # noqa: E402
+from dns_de_rte_orchestrator.reporter_lambda import lambda_handler  # noqa: E402
+
+
+def make_get_event(id: str | None = "req-123") -> dict[str, object]:
+    return {
+        "pathParameters": {"id": id} if id is not None else None,
+        "httpMethod": "GET",
+    }
+
+
+def make_mock_reader(entries: list[AuditEntry] | Exception) -> FallbackAuditLogReader:
+    mock = MagicMock(spec=FallbackAuditLogReader)
+    if isinstance(entries, Exception):
+        mock.get_logs.side_effect = entries
+    else:
+        mock.get_logs.return_value = entries
+    return mock
+
+
+def make_context() -> MagicMock:
+    ctx = MagicMock()
+    return ctx
+
+
+TS = datetime(2026, 5, 7, 14, 30, 45, tzinfo=timezone.utc)
+
+
+def test_lambda_handler_returns_200_with_entries(monkeypatch):
+    entries = [
+        AuditEntry(id="req-123", timestamp=TS, message="created"),
+        AuditEntry(
+            id="req-123",
+            timestamp=datetime(2026, 5, 7, 15, 0, 0, tzinfo=timezone.utc),
+            message="processed",
+        ),
+    ]
+    monkeypatch.setattr(reporter_module, "reader", make_mock_reader(entries))
+
+    response = lambda_handler(make_get_event("req-123"), make_context())
+
+    assert response["statusCode"] == 200
+    body = json.loads(response["body"])  # type: ignore[arg-type]
+    assert body["id"] == "req-123"
+    assert len(body["entries"]) == 2
+    assert body["entries"][0]["message"] == "created"
+    assert body["entries"][1]["message"] == "processed"
+    assert body["entries"][0]["timestamp"] == "2026-05-07T14:30:45+00:00"
+
+
+def test_lambda_handler_returns_404_when_no_entries(monkeypatch):
+    monkeypatch.setattr(reporter_module, "reader", make_mock_reader([]))
+
+    response = lambda_handler(make_get_event("req-unknown"), make_context())
+
+    assert response["statusCode"] == 404
+    body = json.loads(response["body"])  # type: ignore[arg-type]
+    assert body["id"] == "req-unknown"
+    assert "error" in body
+
+
+def test_lambda_handler_returns_400_when_path_param_missing(monkeypatch):
+    monkeypatch.setattr(reporter_module, "reader", make_mock_reader([]))
+    event: dict[str, object] = {"pathParameters": None}
+
+    response = lambda_handler(event, make_context())
+
+    assert response["statusCode"] == 400
+    body = json.loads(response["body"])  # type: ignore[arg-type]
+    assert "error" in body
+
+
+def test_lambda_handler_returns_400_when_id_is_empty_string(monkeypatch):
+    monkeypatch.setattr(reporter_module, "reader", make_mock_reader([]))
+
+    response = lambda_handler(make_get_event("  "), make_context())
+
+    assert response["statusCode"] == 400
+
+
+def test_lambda_handler_returns_400_when_pathparameters_key_absent(monkeypatch):
+    monkeypatch.setattr(reporter_module, "reader", make_mock_reader([]))
+    event: dict[str, object] = {}
+
+    response = lambda_handler(event, make_context())
+
+    assert response["statusCode"] == 400
+
+
+def test_lambda_handler_returns_500_on_reader_exception(monkeypatch):
+    monkeypatch.setattr(
+        reporter_module, "reader", make_mock_reader(RuntimeError("dynamo down"))
+    )
+
+    response = lambda_handler(make_get_event("req-123"), make_context())
+
+    assert response["statusCode"] == 500
+    body = json.loads(response["body"])  # type: ignore[arg-type]
+    assert body["error"] == "internal error"
+
+
+def test_lambda_handler_response_has_json_content_type(monkeypatch):
+    entries = [AuditEntry(id="req-1", timestamp=TS, message="msg")]
+    monkeypatch.setattr(reporter_module, "reader", make_mock_reader(entries))
+
+    response = lambda_handler(make_get_event("req-1"), make_context())
+
+    assert response["headers"] == {"Content-Type": "application/json"}  # type: ignore[index]
+
+
+def test_lambda_handler_entry_shape_matches_audit_entry_to_json(monkeypatch):
+    entry = AuditEntry(id="req-1", timestamp=TS, message="test msg")
+    monkeypatch.setattr(reporter_module, "reader", make_mock_reader([entry]))
+
+    response = lambda_handler(make_get_event("req-1"), make_context())
+
+    body = json.loads(response["body"])  # type: ignore[arg-type]
+    assert body["entries"][0] == entry.to_json()

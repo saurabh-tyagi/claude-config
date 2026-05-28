@@ -1,0 +1,873 @@
+On branch DATA_4715_audit_log_to_s3
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   TODO.md
+	modified:   src/dns_de_rte_orchestrator/audit_logging.py
+	modified:   src/dns_de_rte_orchestrator/processor_lambda.py
+	modified:   src/dns_de_rte_orchestrator/request_processor.py
+	modified:   template.yaml
+	modified:   tests/test_audit_logging.py
+	modified:   tests/test_dynamodb_audit_logger.py
+	modified:   tests/test_request_processor.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	tests/test_s3_audit_log_writer.py
+
+no changes added to commit (use "git add" and/or "git commit -a")
+diff --git a/TODO.md b/TODO.md
+index c99415e..159039e 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -57,7 +57,7 @@ project. It is intended to help guide human and AI agents:
+   - [x] Add audit logging retrieval
+     - [x] Create an API endpoint to get audit log for an erasure id
+     - [x] Create a new lambda to handle audit retrieval functionality
+-  - [ ] Add audit logging materialising to S3 after successful erasure
++  - [x] Add audit logging materialising to S3 after successful erasure
+ - [x] Add `.gitlab-ci.yml` and enable GitLab CI/CD
+ - [x] Make sure tests are run in CI/CD
+ - [x] Make sure tests only run in CI/CD when code changes happen
+diff --git a/src/dns_de_rte_orchestrator/audit_logging.py b/src/dns_de_rte_orchestrator/audit_logging.py
+index 77a2503..d54baa8 100644
+--- a/src/dns_de_rte_orchestrator/audit_logging.py
++++ b/src/dns_de_rte_orchestrator/audit_logging.py
+@@ -158,6 +158,40 @@ class DynamoDBAuditLogger(AuditLogger):
+                 results.append(self._item_to_entry(item))
+         return results
+ 
++    def delete_logs(self, id: str) -> None:
++        """Delete all audit log entries for the given erasure id from DynamoDB."""
++        paginator = self.dynamodb.get_paginator("query")
++        pages = paginator.paginate(
++            TableName=self.table_name,
++            KeyConditionExpression="#id = :id",
++            ExpressionAttributeNames={
++                "#id": AuditEntry.ID_FIELD,
++                "#ts": AuditEntry.TIMESTAMP_FIELD,
++            },
++            ExpressionAttributeValues={":id": {"S": id}},
++            ProjectionExpression="#id, #ts",
++        )
++        keys: list[dict[str, AttributeValueTypeDef]] = []
++        for page in pages:
++            for item in page.get("Items", []):
++                keys.append(
++                    {
++                        AuditEntry.ID_FIELD: item[AuditEntry.ID_FIELD],
++                        AuditEntry.TIMESTAMP_FIELD: item[AuditEntry.TIMESTAMP_FIELD],
++                    }
++                )
++        # BatchWriteItem accepts at most 25 requests per call
++        chunk_size = 25
++        for i in range(0, len(keys), chunk_size):
++            chunk = keys[i : i + chunk_size]
++            _ = self.dynamodb.batch_write_item(
++                RequestItems={
++                    self.table_name: [
++                        {"DeleteRequest": {"Key": key}} for key in chunk
++                    ]
++                }
++            )
++
+     @classmethod
+     def _create_item(cls, id: str, message: str, timestamp: datetime):
+         timestamp_ms: int = int(timestamp.timestamp() * 1000)
+@@ -187,6 +221,13 @@ class DynamoDBAuditLogger(AuditLogger):
+         return AuditEntry(id=id_value, timestamp=timestamp, message=message)
+ 
+ 
++def _s3_key_for(prefix: str, id: str) -> str:
++    """Return the S3 key for a materialised audit log object."""
++    if prefix:
++        return f"{prefix}/{id}.jsonl.gz"
++    return f"{id}.jsonl.gz"
++
++
+ class S3AuditLogReader:
+     """Reads materialised audit logs from S3.
+ 
+@@ -200,9 +241,7 @@ class S3AuditLogReader:
+         self.s3: S3Client = s3_client
+ 
+     def _key_for(self, id: str) -> str:
+-        if self.prefix:
+-            return f"{self.prefix}/{id}.jsonl.gz"
+-        return f"{id}.jsonl.gz"
++        return _s3_key_for(self.prefix, id)
+ 
+     def get_logs(self, id: str) -> list[AuditEntry]:
+         key = self._key_for(id)
+@@ -244,6 +283,51 @@ class FallbackAuditLogReader:
+         return self.fallback.get_logs(id)
+ 
+ 
++class S3AuditLogWriter:
++    """Writes a materialised audit log for a single erasure id to S3.
++
++    Produces the identical gzipped JSON Lines format that ``S3AuditLogReader``
++    consumes, so ``FallbackAuditLogReader`` continues to work without changes.
++    """
++
++    def __init__(self, bucket: str, prefix: str, s3_client: S3Client) -> None:
++        self.bucket: str = bucket
++        self.prefix: str = prefix.strip("/")
++        self.s3: S3Client = s3_client
++
++    def write(self, id: str, entries: list[AuditEntry]) -> None:
++        key = _s3_key_for(self.prefix, id)
++        lines = "\n".join(json.dumps(entry.to_json()) for entry in entries)
++        body = gzip.compress(lines.encode("utf-8"))
++        _ = self.s3.put_object(Bucket=self.bucket, Key=key, Body=body)
++        logger.info("Archived %d audit log entries to s3://%s/%s", len(entries), self.bucket, key)
++
++
++class AuditArchiver:
++    """Archives audit logs for an erasure request to S3 then removes them from DynamoDB.
++
++    Write order is intentional: S3 first, then DynamoDB delete. If the delete
++    fails mid-way the DynamoDB copy still exists so ``FallbackAuditLogReader``
++    will never return empty results. Retrying ``archive`` is safe — the S3
++    object is overwritten and ``delete_logs`` tolerates already-deleted items.
++    """
++
++    def __init__(
++        self, primary: DynamoDBAuditLogger, writer: S3AuditLogWriter
++    ) -> None:
++        self.primary: DynamoDBAuditLogger = primary
++        self.writer: S3AuditLogWriter = writer
++
++    def archive(self, id: str) -> None:
++        entries = self.primary.get_logs(id)
++        if not entries:
++            logger.info("No audit log entries to archive for id %s", id)
++            return
++        self.writer.write(id, entries)
++        self.primary.delete_logs(id)
++        logger.info("Audit log for id %s archived and removed from DynamoDB", id)
++
++
+ DYNAMO_DB_AUDIT_LOGGING_TABLE: Literal["DYNAMO_DB_AUDIT_LOGGING_TABLE"] = (
+     "DYNAMO_DB_AUDIT_LOGGING_TABLE"
+ )
+@@ -291,3 +375,28 @@ def get_audit_log_reader() -> FallbackAuditLogReader:
+ 
+     fallback = get_s3_audit_log_reader(bucket=bucket, prefix=prefix)
+     return FallbackAuditLogReader(primary=primary, fallback=fallback)
++
++
++def get_s3_audit_log_writer(bucket: str, prefix: str) -> S3AuditLogWriter:
++    s3 = boto3.client("s3")
++    return S3AuditLogWriter(bucket=bucket, prefix=prefix, s3_client=s3)
++
++
++def get_audit_log_archiver() -> AuditArchiver:
++    """Get an AuditArchiver configured from environment variables.
++
++    Requires ``DYNAMO_DB_AUDIT_LOGGING_TABLE``, ``AUDIT_LOG_S3_BUCKET``, and
++    optionally ``AUDIT_LOG_S3_PREFIX``.
++    """
++    table_name: str | None = os.getenv(DYNAMO_DB_AUDIT_LOGGING_TABLE)
++    if table_name is None:
++        raise ValueError(f"{DYNAMO_DB_AUDIT_LOGGING_TABLE} was not set")
++
++    bucket: str | None = os.getenv(AUDIT_LOG_S3_BUCKET)
++    if bucket is None or bucket == "":
++        raise ValueError(f"{AUDIT_LOG_S3_BUCKET} was not set")
++    prefix: str = os.getenv(AUDIT_LOG_S3_PREFIX, "")
++
++    primary = get_dynamodb_audit_logger(table_name)
++    writer = get_s3_audit_log_writer(bucket=bucket, prefix=prefix)
++    return AuditArchiver(primary=primary, writer=writer)
+diff --git a/src/dns_de_rte_orchestrator/processor_lambda.py b/src/dns_de_rte_orchestrator/processor_lambda.py
+index 35f962b..780d2b2 100644
+--- a/src/dns_de_rte_orchestrator/processor_lambda.py
++++ b/src/dns_de_rte_orchestrator/processor_lambda.py
+@@ -8,7 +8,12 @@ from aws_lambda_powertools.utilities.typing import LambdaContext
+ from dotenv import load_dotenv
+ 
+ from dns_de_rte_orchestrator.as400 import AS400Notifier, NoOpAS400Notifier
+-from dns_de_rte_orchestrator.audit_logging import AuditLogger, get_audit_logger
++from dns_de_rte_orchestrator.audit_logging import (
++    AuditArchiver,
++    AuditLogger,
++    get_audit_log_archiver,
++    get_audit_logger,
++)
+ from dns_de_rte_orchestrator.customer_api_client import (
+     CustomerAPIClient,
+     HTTPCustomerAPIClient,
+@@ -48,8 +53,15 @@ request_repo: RequestRepository = get_request_repository()
+ audit: AuditLogger = get_audit_logger()
+ as400: AS400Notifier = NoOpAS400Notifier()  # TODO: add actual AS400 notifying
+ customer_api: CustomerAPIClient = HTTPCustomerAPIClient(customer_api_url)
++
++archiver: AuditArchiver | None = None
++try:
++    archiver = get_audit_log_archiver()
++except ValueError:
++    logger.warning("Audit log archiver not configured; archival will be skipped")
++
+ processor: RequestProcessor = RequestProcessor(
+-    request_repo, audit, as400, customer_api, dry_run=in_dry_run_mode
++    request_repo, audit, as400, customer_api, dry_run=in_dry_run_mode, archiver=archiver
+ )
+ 
+ 
+diff --git a/src/dns_de_rte_orchestrator/request_processor.py b/src/dns_de_rte_orchestrator/request_processor.py
+index 66e9dfb..c237aff 100644
+--- a/src/dns_de_rte_orchestrator/request_processor.py
++++ b/src/dns_de_rte_orchestrator/request_processor.py
+@@ -4,7 +4,7 @@ from datetime import datetime
+ from typing import Final
+ 
+ from dns_de_rte_orchestrator.as400 import AS400Notifier
+-from dns_de_rte_orchestrator.audit_logging import AuditLogger
++from dns_de_rte_orchestrator.audit_logging import AuditArchiver, AuditLogger
+ from dns_de_rte_orchestrator.customer_api_client import (
+     ALL_SITE_IDS,
+     CustomerAPIClient,
+@@ -39,12 +39,14 @@ class RequestProcessor:
+         as400: AS400Notifier,
+         customer_api: CustomerAPIClient,
+         dry_run: bool = False,
++        archiver: AuditArchiver | None = None,
+     ) -> None:
+         self.repo: RequestRepository = repository
+         self.audit: AuditLogger = audit
+         self.as400: AS400Notifier = as400
+         self.dry_run: Final[bool] = dry_run
+         self.customer_api: CustomerAPIClient = customer_api
++        self.archiver: AuditArchiver | None = archiver
+         if dry_run:
+             logger.warning("Request Processor is in dry-run mode")
+ 
+@@ -183,10 +185,20 @@ class RequestProcessor:
+                 self.process_phase2(request)
+             case "phase-3":
+                 self.process_phase3(request)
++            case "done":
++                pass
+             case _:
+                 raise NotImplementedError(
+                     f'Request processing of state "{request_state}" not implemented'
+                 )
++        if not self.dry_run and request.state == "done" and self.archiver is not None:
++            try:
++                self.archiver.archive(request.id)
++            except Exception:
++                logger.exception(
++                    "Failed to archive audit log for request %s; will be retried on next invocation",
++                    request.id,
++                )
+ 
+     @classmethod
+     def _validate_request(
+@@ -219,7 +231,7 @@ class RequestProcessor:
+             self.repo.update(request)
+         message = f"Request was transitioned to {new_state}"
+         if reason:
+-            message = message = " due to: " + reason
++            message = message + " due to: " + reason
+         if not self.dry_run:
+             self.audit.log(request.id, message)
+ 
+diff --git a/template.yaml b/template.yaml
+index 7af8a32..d2dd266 100644
+--- a/template.yaml
++++ b/template.yaml
+@@ -182,11 +182,26 @@ Resources:
+           PROCESS_SAFETY_MARGIN_MS: "5000"
+           DRY_RUN_MODE: !Ref DryRunMode
+           CUSTOMER_API_URL: !Sub "https://customer-api-proxy-internal-eks.eu-west-1.${Environment}.hbi.systems/v1/customer/find"
++          AUDIT_LOG_S3_BUCKET: !Ref AuditLogS3Bucket
++          AUDIT_LOG_S3_PREFIX: !Ref AuditLogS3Prefix
+           POWERTOOLS_SERVICE_NAME: !Sub "process-erasure-requests-${Environment}"
+           # POWERTOOLS_LOGGER_LOG_EVENT must NOT be set — the incoming event
+           # contains erasure_details (PII: email, name, postcode), which
+           # should not be persisted in CloudWatch logs.
+ 
++  ProcessS3WritePolicy:
++    Type: AWS::IAM::Policy
++    Properties:
++      PolicyName: !Sub "rte-orchestrator-process-s3-write-${Environment}"
++      PolicyDocument:
++        Version: "2012-10-17"
++        Statement:
++          - Effect: Allow
++            Action: s3:PutObject
++            Resource: !Sub "arn:aws:s3:::${AuditLogS3Bucket}/${AuditLogS3Prefix}/*"
++      Roles:
++        - !GetAtt ProcessServerlessAccessManager.LambdaExecutionRoleName
++
+   ReporterServerlessAccessManager:
+     Type: Custom::ServerlessAccessManager
+     Properties:
+diff --git a/tests/test_audit_logging.py b/tests/test_audit_logging.py
+index 5365e27..5f4cfc7 100644
+--- a/tests/test_audit_logging.py
++++ b/tests/test_audit_logging.py
+@@ -18,16 +18,20 @@ from dns_de_rte_orchestrator.audit_logging import (
+     AUDIT_LOG_S3_BUCKET,
+     AUDIT_LOG_S3_PREFIX,
+     DYNAMO_DB_AUDIT_LOGGING_TABLE,
++    AuditArchiver,
+     AuditEntry,
+     DynamoDBAuditLogger,
+     FallbackAuditLogReader,
+     InMemoryAuditLogger,
+     NoOpAuditLogger,
+     S3AuditLogReader,
++    S3AuditLogWriter,
++    get_audit_log_archiver,
+     get_audit_log_reader,
+     get_audit_logger,
+     get_dynamodb_audit_logger,
+     get_s3_audit_log_reader,
++    get_s3_audit_log_writer,
+ )
+ 
+ _DdbPage = dict[str, Any]  # pyright: ignore[reportExplicitAny]
+@@ -50,6 +54,7 @@ class StubDynamoDBClient:
+ 
+     def __init__(self, query_pages: list[_DdbPage] | None = None) -> None:
+         self.put_item_calls: list[dict[str, object]] = []
++        self.batch_write_item_calls: list[dict[str, object]] = []
+         self._query_pages = query_pages or []
+         self._paginator: StubDynamoDBPaginator | None = None
+ 
+@@ -57,6 +62,10 @@ class StubDynamoDBClient:
+         self.put_item_calls.append(kwargs)
+         return {}
+ 
++    def batch_write_item(self, **kwargs: object) -> dict[str, object]:
++        self.batch_write_item_calls.append(kwargs)
++        return {}
++
+     def get_paginator(self, operation: str) -> StubDynamoDBPaginator:
+         assert operation == "query"
+         self._paginator = StubDynamoDBPaginator(self._query_pages)
+@@ -641,3 +650,279 @@ def test_get_audit_log_reader_uses_empty_prefix_by_default(monkeypatch: MonkeyPa
+ 
+     assert isinstance(reader, FallbackAuditLogReader)
+     assert reader.fallback.prefix == ""
++
++
++# --- DynamoDBAuditLogger.delete_logs ---
++
++
++def _make_dynamo_pages_with_keys(
++    id: str, timestamps: list[int]
++) -> list[dict[str, object]]:
++    return [
++        {
++            "Items": [
++                {
++                    AuditEntry.ID_FIELD: {"S": id},
++                    AuditEntry.TIMESTAMP_FIELD: {"N": str(ts)},
++                }
++                for ts in timestamps
++            ]
++        }
++    ]
++
++
++def test_delete_logs_calls_batch_write_with_correct_keys():
++    ts1, ts2 = 1000000, 2000000
++    pages = _make_dynamo_pages_with_keys("req-1", [ts1, ts2])
++    client = StubDynamoDBClient(query_pages=pages)
++    logger = DynamoDBAuditLogger(
++        table_name="audit-table",
++        dynamodb=cast(DynamoDBClient, cast(object, client)),
++    )
++
++    logger.delete_logs("req-1")
++
++    assert len(client.batch_write_item_calls) == 1
++    call = client.batch_write_item_calls[0]
++    requests = cast(
++        list[dict[str, object]],
++        cast(dict[str, object], call["RequestItems"])["audit-table"],
++    )
++    delete_keys = [
++        cast(dict[str, object], cast(dict[str, object], r["DeleteRequest"])["Key"])
++        for r in requests
++    ]
++    assert {
++        AuditEntry.ID_FIELD: {"S": "req-1"},
++        AuditEntry.TIMESTAMP_FIELD: {"N": str(ts1)},
++    } in delete_keys
++    assert {
++        AuditEntry.ID_FIELD: {"S": "req-1"},
++        AuditEntry.TIMESTAMP_FIELD: {"N": str(ts2)},
++    } in delete_keys
++
++
++def test_delete_logs_noop_when_no_entries():
++    client = StubDynamoDBClient(query_pages=[{"Items": []}])
++    logger = DynamoDBAuditLogger(
++        table_name="audit-table",
++        dynamodb=cast(DynamoDBClient, cast(object, client)),
++    )
++
++    logger.delete_logs("req-missing")
++
++    assert client.batch_write_item_calls == []
++
++
++def test_delete_logs_batches_in_chunks_of_25():
++    timestamps = list(range(1_000_000, 1_000_000 + 30))
++    pages = _make_dynamo_pages_with_keys("req-big", timestamps)
++    client = StubDynamoDBClient(query_pages=pages)
++    logger = DynamoDBAuditLogger(
++        table_name="audit-table",
++        dynamodb=cast(DynamoDBClient, cast(object, client)),
++    )
++
++    logger.delete_logs("req-big")
++
++    # 30 items → 2 batches (25 + 5)
++    assert len(client.batch_write_item_calls) == 2
++    first_batch = cast(
++        list[object],
++        cast(dict[str, object], client.batch_write_item_calls[0]["RequestItems"])[
++            "audit-table"
++        ],
++    )
++    second_batch = cast(
++        list[object],
++        cast(dict[str, object], client.batch_write_item_calls[1]["RequestItems"])[
++            "audit-table"
++        ],
++    )
++    assert len(first_batch) == 25
++    assert len(second_batch) == 5
++
++
++# --- S3AuditLogWriter ---
++
++
++def _make_stub_s3_writer() -> MagicMock:
++    stub: MagicMock = MagicMock()
++    cast(MagicMock, stub.put_object).return_value = {}
++    return stub
++
++
++def test_s3_writer_puts_gzipped_jsonl():
++    s3 = _make_stub_s3_writer()
++    writer = S3AuditLogWriter(
++        bucket="my-bucket", prefix="audit", s3_client=cast(S3Client, s3)
++    )
++    ts = datetime(2026, 5, 7, 14, 30, 45, tzinfo=timezone.utc)
++    entries = [
++        AuditEntry(id="req-1", timestamp=ts, message="first"),
++        AuditEntry(id="req-1", timestamp=ts, message="second"),
++    ]
++
++    writer.write("req-1", entries)
++
++    cast(MagicMock, s3.put_object).assert_called_once()
++    call_kwargs: dict[str, object] = cast(
++        dict[str, object], cast(MagicMock, s3.put_object).call_args[1]
++    )
++    assert call_kwargs["Bucket"] == "my-bucket"
++    assert call_kwargs["Key"] == "audit/req-1.jsonl.gz"
++    body: bytes = cast(bytes, call_kwargs["Body"])
++    lines = gzip.decompress(body).decode("utf-8").splitlines()
++    assert len(lines) == 2
++    parsed = [json.loads(line) for line in lines]
++    assert cast(dict[str, object], parsed[0])["message"] == "first"
++    assert cast(dict[str, object], parsed[1])["message"] == "second"
++
++
++def test_s3_writer_empty_prefix_omits_slash():
++    s3 = _make_stub_s3_writer()
++    writer = S3AuditLogWriter(
++        bucket="bucket", prefix="", s3_client=cast(S3Client, s3)
++    )
++    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
++    writer.write("req-x", [AuditEntry(id="req-x", timestamp=ts, message="m")])
++
++    cast(MagicMock, s3.put_object).assert_called_once()
++    key: str = cast(
++        str, cast(dict[str, object], cast(MagicMock, s3.put_object).call_args[1])["Key"]
++    )
++    assert key == "req-x.jsonl.gz"
++
++
++def test_s3_writer_propagates_client_errors():
++    from botocore.exceptions import ClientError
++
++    s3: MagicMock = MagicMock()
++    cast(MagicMock, s3.put_object).side_effect = ClientError(
++        {"Error": {"Code": "AccessDenied", "Message": ""}}, "PutObject"
++    )
++    writer = S3AuditLogWriter(
++        bucket="bucket", prefix="pfx", s3_client=cast(S3Client, s3)
++    )
++    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
++
++    with pytest.raises(ClientError):
++        writer.write("req-1", [AuditEntry(id="req-1", timestamp=ts, message="m")])
++
++
++# --- AuditArchiver ---
++
++
++def _make_dynamo_logger_mock(entries: list[AuditEntry]) -> MagicMock:
++    mock: MagicMock = MagicMock(spec=DynamoDBAuditLogger)
++    cast(MagicMock, mock.get_logs).return_value = entries
++    return mock
++
++
++def test_archiver_writes_to_s3_then_deletes_from_dynamo():
++    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
++    entries = [AuditEntry(id="req-1", timestamp=ts, message="msg")]
++    dynamo_mock = _make_dynamo_logger_mock(entries)
++    s3_writer_mock: MagicMock = MagicMock(spec=S3AuditLogWriter)
++    archiver = AuditArchiver(
++        primary=cast(DynamoDBAuditLogger, dynamo_mock),
++        writer=cast(S3AuditLogWriter, s3_writer_mock),
++    )
++
++    archiver.archive("req-1")
++
++    cast(MagicMock, s3_writer_mock.write).assert_called_once_with("req-1", entries)
++    cast(MagicMock, dynamo_mock.delete_logs).assert_called_once_with("req-1")
++
++
++def test_archiver_does_not_delete_if_s3_write_raises():
++    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
++    entries = [AuditEntry(id="req-1", timestamp=ts, message="msg")]
++    dynamo_mock = _make_dynamo_logger_mock(entries)
++    s3_writer_mock: MagicMock = MagicMock(spec=S3AuditLogWriter)
++    cast(MagicMock, s3_writer_mock.write).side_effect = RuntimeError("S3 down")
++    archiver = AuditArchiver(
++        primary=cast(DynamoDBAuditLogger, dynamo_mock),
++        writer=cast(S3AuditLogWriter, s3_writer_mock),
++    )
++
++    with pytest.raises(RuntimeError):
++        archiver.archive("req-1")
++
++    cast(MagicMock, dynamo_mock.delete_logs).assert_not_called()
++
++
++def test_archiver_noop_when_no_entries():
++    dynamo_mock = _make_dynamo_logger_mock([])
++    s3_writer_mock: MagicMock = MagicMock(spec=S3AuditLogWriter)
++    archiver = AuditArchiver(
++        primary=cast(DynamoDBAuditLogger, dynamo_mock),
++        writer=cast(S3AuditLogWriter, s3_writer_mock),
++    )
++
++    archiver.archive("req-empty")
++
++    cast(MagicMock, s3_writer_mock.write).assert_not_called()
++    cast(MagicMock, dynamo_mock.delete_logs).assert_not_called()
++
++
++# --- get_s3_audit_log_writer ---
++
++
++def test_get_s3_audit_log_writer_builds_boto3_client(monkeypatch: MonkeyPatch):
++    s3_stub: MagicMock = MagicMock()
++    calls: list[str] = []
++
++    def fake_boto3_client(service_name: str) -> MagicMock:
++        calls.append(service_name)
++        return s3_stub
++
++    monkeypatch.setattr(
++        "dns_de_rte_orchestrator.audit_logging.boto3.client", fake_boto3_client
++    )
++
++    writer = get_s3_audit_log_writer("my-bucket", "my-prefix")
++
++    assert isinstance(writer, S3AuditLogWriter)
++    assert writer.bucket == "my-bucket"
++    assert writer.prefix == "my-prefix"
++    assert "s3" in calls
++
++
++# --- get_audit_log_archiver ---
++
++
++def test_get_audit_log_archiver_raises_without_table(monkeypatch: MonkeyPatch):
++    monkeypatch.delenv(DYNAMO_DB_AUDIT_LOGGING_TABLE, raising=False)
++    monkeypatch.setenv(AUDIT_LOG_S3_BUCKET, "bucket")
++
++    with pytest.raises(ValueError, match=DYNAMO_DB_AUDIT_LOGGING_TABLE):
++        _ = get_audit_log_archiver()
++
++
++def test_get_audit_log_archiver_raises_without_s3_bucket(monkeypatch: MonkeyPatch):
++    monkeypatch.setenv(DYNAMO_DB_AUDIT_LOGGING_TABLE, "audit-table")
++    monkeypatch.delenv(AUDIT_LOG_S3_BUCKET, raising=False)
++
++    with pytest.raises(ValueError, match=AUDIT_LOG_S3_BUCKET):
++        _ = get_audit_log_archiver()
++
++
++def test_get_audit_log_archiver_returns_archiver(monkeypatch: MonkeyPatch):
++    monkeypatch.setenv(DYNAMO_DB_AUDIT_LOGGING_TABLE, "audit-table")
++    monkeypatch.setenv(AUDIT_LOG_S3_BUCKET, "my-bucket")
++    monkeypatch.setenv(AUDIT_LOG_S3_PREFIX, "logs")
++
++    def fake_boto3_client(_service_name: str) -> MagicMock:
++        return MagicMock()
++
++    monkeypatch.setattr(
++        "dns_de_rte_orchestrator.audit_logging.boto3.client", fake_boto3_client
++    )
++
++    archiver = get_audit_log_archiver()
++
++    assert isinstance(archiver, AuditArchiver)
++    assert archiver.writer.bucket == "my-bucket"
++    assert archiver.writer.prefix == "logs"
++    assert archiver.primary.table_name == "audit-table"
+diff --git a/tests/test_dynamodb_audit_logger.py b/tests/test_dynamodb_audit_logger.py
+index 9917da7..99fe912 100644
+--- a/tests/test_dynamodb_audit_logger.py
++++ b/tests/test_dynamodb_audit_logger.py
+@@ -1,14 +1,24 @@
+ from collections.abc import Generator
+ from datetime import datetime, timedelta, timezone
+-from typing import Literal
++from typing import TYPE_CHECKING, Literal, cast
++from unittest.mock import MagicMock
+ 
+ import boto3
+ import pytest
+ from boto3.dynamodb.conditions import Key
++from botocore.exceptions import ClientError
+ from moto import mock_aws
+ from types_boto3_dynamodb.service_resource import Table
+ 
+-from dns_de_rte_orchestrator.audit_logging import AuditEntry, DynamoDBAuditLogger
++from dns_de_rte_orchestrator.audit_logging import (
++    AuditArchiver,
++    AuditEntry,
++    DynamoDBAuditLogger,
++    S3AuditLogWriter,
++)
++
++if TYPE_CHECKING:
++    from types_boto3_s3.client import S3Client
+ 
+ TEST_TABLE_NAME: Literal["test_audit_table"] = "test_audit_table"
+ 
+@@ -16,7 +26,7 @@ TEST_TABLE_NAME: Literal["test_audit_table"] = "test_audit_table"
+ @pytest.fixture
+ def dynamodb_table() -> Generator[Table, None, None]:
+     with mock_aws():
+-        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
++        dynamodb = boto3.resource("dynamodb", region_name="eu-west-1")
+         table = dynamodb.create_table(
+             TableName=TEST_TABLE_NAME,
+             KeySchema=[
+@@ -43,7 +53,7 @@ def dynamodb_table() -> Generator[Table, None, None]:
+ 
+ 
+ def build_audit_logger() -> DynamoDBAuditLogger:
+-    client = boto3.client("dynamodb", region_name="us-east-1")
++    client = boto3.client("dynamodb", region_name="eu-west-1")
+     return DynamoDBAuditLogger(
+         table_name=TEST_TABLE_NAME,
+         dynamodb=client,
+@@ -173,3 +183,68 @@ def test_get_logs_returns_empty_for_unknown_id():
+     logger = build_audit_logger()
+ 
+     assert logger.get_logs("no-such-id") == []
++
++
++@pytest.mark.usefixtures("dynamodb_table")
++def test_delete_logs_removes_all_entries_for_id():
++    logger = build_audit_logger()
++    ts1 = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
++    ts2 = datetime(2026, 5, 7, 11, 0, 0, tzinfo=timezone.utc)
++
++    logger.log("req-del", "first", ts1)
++    logger.log("req-del", "second", ts2)
++    assert len(logger.get_logs("req-del")) == 2
++
++    logger.delete_logs("req-del")
++
++    assert logger.get_logs("req-del") == []
++
++
++@pytest.mark.usefixtures("dynamodb_table")
++def test_delete_logs_does_not_affect_other_ids():
++    logger = build_audit_logger()
++    ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
++
++    logger.log("req-keep", "stay", ts)
++    logger.log("req-gone", "go", ts)
++
++    logger.delete_logs("req-gone")
++
++    assert logger.get_logs("req-gone") == []
++    assert len(logger.get_logs("req-keep")) == 1
++
++
++@pytest.mark.usefixtures("dynamodb_table")
++def test_delete_logs_noop_for_unknown_id():
++    logger = build_audit_logger()
++    ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
++    logger.log("req-existing", "entry", ts)
++
++    logger.delete_logs("no-such-id")
++
++    assert len(logger.get_logs("req-existing")) == 1
++
++
++@pytest.mark.usefixtures("dynamodb_table")
++def test_audit_log_preserved_in_dynamodb_when_s3_write_fails():
++    dynamo_logger = build_audit_logger()
++    ts1 = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
++    ts2 = datetime(2026, 5, 7, 11, 0, 0, tzinfo=timezone.utc)
++    dynamo_logger.log("req-s3-fail", "first entry", ts1)
++    dynamo_logger.log("req-s3-fail", "second entry", ts2)
++
++    failing_s3: MagicMock = MagicMock()
++    cast(MagicMock, failing_s3.put_object).side_effect = ClientError(
++        {"Error": {"Code": "ServiceUnavailable", "Message": "S3 down"}}, "PutObject"
++    )
++    writer = S3AuditLogWriter(
++        bucket="bucket", prefix="pfx", s3_client=cast("S3Client", failing_s3)
++    )
++    archiver = AuditArchiver(primary=dynamo_logger, writer=writer)
++
++    with pytest.raises(ClientError):
++        archiver.archive("req-s3-fail")
++
++    surviving = dynamo_logger.get_logs("req-s3-fail")
++    assert len(surviving) == 2
++    assert [e.message for e in surviving] == ["first entry", "second entry"]
+diff --git a/tests/test_request_processor.py b/tests/test_request_processor.py
+index 3b04f42..279aa72 100644
+--- a/tests/test_request_processor.py
++++ b/tests/test_request_processor.py
+@@ -1,16 +1,17 @@
+ from datetime import datetime, timedelta
+-from typing import override
++from typing import cast, override
++from unittest.mock import MagicMock
+ 
+ import pytest
+ 
+ from dns_de_rte_orchestrator.as400 import NoOpAS400Notifier
+-from dns_de_rte_orchestrator.audit_logging import NoOpAuditLogger
++from dns_de_rte_orchestrator.audit_logging import AuditArchiver, NoOpAuditLogger
+ from dns_de_rte_orchestrator.customer_api_client import (
+     CustomerAPIClient,
+     CustomerAPISiteID,
+     CustomerDetails,
+ )
+-from dns_de_rte_orchestrator.erasure_request import ErasureRequest
++from dns_de_rte_orchestrator.erasure_request import ErasureRequest, ErasureState
+ from dns_de_rte_orchestrator.request_processor import (
+     MissingEmailAddress,
+     RequestProcessor,
+@@ -104,6 +105,37 @@ def test_empty_enrichment():
+     proc.enrich_request(request)
+ 
+ 
++def _make_archiver_mock() -> MagicMock:
++    return MagicMock(spec=AuditArchiver)
++
++
++def _build_processor(
++    archiver: AuditArchiver | None = None,
++    dry_run: bool = False,
++) -> tuple[RequestProcessor, InMemoryRequestRepository]:
++    repo = InMemoryRequestRepository()
++    proc = RequestProcessor(
++        repository=repo,
++        audit=NoOpAuditLogger(),
++        as400=NoOpAS400Notifier(),
++        customer_api=StubCustomerAPI(),
++        dry_run=dry_run,
++        archiver=archiver,
++    )
++    return proc, repo
++
++
++def _make_request(state: ErasureState = "new") -> ErasureRequest:
++    return ErasureRequest(
++        id="req-archive",
++        source="test",
++        state=state,
++        date_issued=datetime.now(),
++        erasure_details={"email": "test@example.com"},
++        site_ids=[],
++    )
++
++
+ def test_enrichment_fails_for_missing_email():
+     proc = RequestProcessor(
+         repository=InMemoryRequestRepository(),
+@@ -188,3 +220,61 @@ def test_enrichment():
+     assert enriched_details["phone-number"] == mobile
+     assert enriched_details["rfl"] == loyalty
+     assert request.site_ids == [10, 20]
++
++
++# --- Archiver integration in process_request ---
++
++
++def test_archiver_called_when_request_reaches_done():
++    archiver_mock = _make_archiver_mock()
++    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
++    request = _make_request(state="done")
++    repo.create(request)
++
++    proc.process_request(request)
++
++    cast(MagicMock, archiver_mock.archive).assert_called_once_with("req-archive")
++
++
++def test_archiver_not_called_when_state_is_not_done():
++    archiver_mock = _make_archiver_mock()
++    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
++    # process_new transitions to in-progress, not done
++    request = _make_request(state="new")
++    repo.create(request)
++
++    proc.process_request(request)
++
++    cast(MagicMock, archiver_mock.archive).assert_not_called()
++
++
++def test_archiver_not_called_in_dry_run():
++    archiver_mock = _make_archiver_mock()
++    proc, repo = _build_processor(
++        archiver=cast(AuditArchiver, archiver_mock), dry_run=True
++    )
++    request = _make_request(state="done")
++    repo.create(request)
++
++    proc.process_request(request)
++
++    cast(MagicMock, archiver_mock.archive).assert_not_called()
++
++
++def test_archiver_exception_does_not_propagate():
++    archiver_mock = _make_archiver_mock()
++    cast(MagicMock, archiver_mock.archive).side_effect = RuntimeError("S3 down")
++    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
++    request = _make_request(state="done")
++    repo.create(request)
++
++    # Should not raise even though archiver fails
++    proc.process_request(request)
++
++
++def test_process_request_without_archiver_does_not_raise():
++    proc, repo = _build_processor(archiver=None)
++    request = _make_request(state="done")
++    repo.create(request)
++
++    proc.process_request(request)

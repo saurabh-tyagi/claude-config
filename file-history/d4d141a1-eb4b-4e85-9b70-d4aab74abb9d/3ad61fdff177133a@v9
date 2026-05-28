@@ -1,0 +1,84 @@
+# Plan: Fix HIGH code-review findings (H1–H4)
+
+## Context
+A deep code review of `lambda/untagged-reporter/` surfaced five HIGH issues. This plan addresses four of them (H1–H4). H5 (library-level full-inventory scan) is merged into H2 at the handler layer — the CLI entrypoint is left permissive on purpose.
+
+The goals are:
+- Remove a test that advertises a security behaviour the handler no longer implements, so the test suite's guarantees match reality (H1).
+- Fail closed when `RequiredTags` is unset or empty, so a mis-configured deploy or ad-hoc event cannot dump every taggable resource in the account (H2).
+- Delete an unused `s3:ListBucket` IAM statement — tighten the runtime policy to least privilege (H3).
+- Surface tag drift in the checkpoint diff. Tags are already persisted in the CSV, so the fix is purely additive — the report will now flag resources that lost tags without being removed from the untagged set (H4).
+
+## Files to change
+
+### 1. `lambda/untagged-reporter/test/test_handler.py` (H1)
+Delete `test_lambda_handler_query_string_overrides_required_tags` at lines 125-135. The assertion `body["total_resources"] == 1` passes trivially because the handler ignores `event` — the test advertises an "override" behaviour that no longer exists and would keep passing if someone reintroduced it. The correct contract is already guarded by `test_query_string_overrides_are_ignored` in `test/test_app.py:43-61`, which captures the `required_tags` passed into `run()` and asserts the override string was not propagated.
+
+### 2. `lambda/untagged-reporter/src/app.py` (H2)
+- Change line 63 from `os.environ.get("RequiredTags", "team,product")` to `os.environ.get("RequiredTags", "")` so an unset env var does not silently inject a default and mask a mis-configured deploy.
+- Immediately after computing `required_tags`, add a guard inside the `try`:
+  ```python
+  if not required_tags:
+      logger.error("RequiredTags is empty or unset; refusing to scan (would return full taggable inventory).")
+      return {
+          "statusCode": 400,
+          "headers": {"Content-Type": "application/json"},
+          "body": json.dumps({"error": "RequiredTags is not configured"}),
+      }
+  ```
+- `template.yaml:23` keeps its `Default: 'team,product'` — production deploys stay safe; the handler guard is defence in depth for ad-hoc invocations and CloudFormation param overrides.
+- `main.py` CLI and `scan_untagged_resources` itself are left untouched so the CLI can still do explicit "scan everything" exploration.
+
+### 3. `lambda/untagged-reporter/template.yaml` (H3)
+Delete lines 62-67 (the `s3:ListBucket` statement). `src/checkpoint.py` uses only `GetObject` (line 46) and `PutObject` (line 81); `NoSuchKey`/`404` handling at `checkpoint.py:47-51` is driven by `GetObject`, not `ListBucket`. No other callsite in the Lambda lists the bucket.
+
+### 4. `lambda/untagged-reporter/src/models.py` (H4)
+Extend `CheckpointDiff` at lines 7-10:
+```python
+@dataclass
+class CheckpointDiff:
+    added: List[UntaggedResource]     # new untagged resources since last run
+    removed: List[UntaggedResource]   # resources no longer untagged since last run
+    retagged: List[UntaggedResource] = field(default_factory=list)  # tags changed on same ARN
+```
+
+### 5. `lambda/untagged-reporter/src/checkpoint.py` (H4)
+Update `diff_reports` at lines 90-104 to compute `retagged`:
+```python
+retagged = [
+    curr_by_arn[arn]
+    for arn in curr_by_arn
+    if arn in prev_by_arn and (prev_by_arn[arn].tags or {}) != (curr_by_arn[arn].tags or {})
+]
+return CheckpointDiff(added=added, removed=removed, retagged=retagged)
+```
+No other logic changes — tags are already loaded at line 60 and written at line 79.
+
+### 6. `lambda/untagged-reporter/src/reporter.py` (H4)
+Extend `_diff_to_dict` at lines 77-88 to include:
+- `retagged_count: len(diff.retagged)`
+- `retagged_by_type: _counts_by_type(diff.retagged)`
+- `retagged: [_resource_to_dict(r) for r in diff.retagged]`
+
+Also:
+- `render_summary` (lines 111-117): add `"Tags changed"` row next to the existing three counters.
+- `render_table` (lines 54-64): add a "Tags Changed" section alongside Continuing / New / No Longer Untagged.
+- `render_csv` (lines 147-165): extend the diff-mode branch to emit rows with `status="retagged"`.
+
+### 7. Tests
+
+- `test/test_handler.py`: delete the test identified in step 1. No replacement (H1).
+- `test/test_app.py`: add two tests, both asserting `statusCode == 400` and that `app.run` was **not** called (H2):
+  - `test_empty_required_tags_env_var_returns_400` — sets `RequiredTags=""`.
+  - `test_missing_required_tags_env_var_returns_400` — uses `monkeypatch.delenv("RequiredTags", raising=False)`.
+- `test/test_checkpoint.py::TestDiffReports`: add two tests (H4):
+  - `test_detects_tag_drift_on_same_arn` — same ARN, `prev.tags={"team":"de"}`, `curr.tags={}` → `len(diff.retagged) == 1`, `added == []`, `removed == []`.
+  - `test_identical_tags_produce_no_retagged` — same ARN, same tags → `retagged == []`.
+- `test/test_handler.py::test_lambda_handler_diff_in_json_response`: extend assertions to cover `body["diff"]["retagged_count"]` (expected `0` with current fixture data).
+
+## Verification
+1. Run tests: `cd lambda/untagged-reporter && python3 -m pytest test/` — expect previous total − 1 (H1 deletion) + 4 new tests passing.
+2. Grep for `s3:ListBucket` under `lambda/untagged-reporter/` — expect no matches.
+3. `cd lambda/untagged-reporter && sam build` then `aws-vault exec de -- sam deploy --config-env datalake` — confirms template still validates and deploys.
+4. H2 smoke test: invoke the deployed Function URL with `RequiredTags=""` set via CloudFormation parameter override or local `env -u RequiredTags sam local invoke`; expect `statusCode 400`, body `{"error":"RequiredTags is not configured"}`, and no S3 write.
+5. H4 smoke test: run the Lambda twice against dev; between runs, add or remove a non-required tag on one untagged resource; the second response body should show `diff.retagged_count >= 1` and list the resource under `diff.retagged`.

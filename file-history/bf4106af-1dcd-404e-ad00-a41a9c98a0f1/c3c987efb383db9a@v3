@@ -1,0 +1,57 @@
+# Fix B1 — Retry `BatchWriteItem` `UnprocessedItems` in `delete_logs`
+
+## Context
+
+Code review on branch `DATA_4715_audit_log_to_s3` flagged that `DynamoDBAuditLogger.delete_logs` at `src/dns_de_rte_orchestrator/audit_logging.py:161-191` discards the `BatchWriteItem` response. AWS returns un-deleted keys in `UnprocessedItems` whenever the call is throttled, hits an internal error, or exceeds size envelopes. Today the code drops these silently, so any throttled deletes produce orphan rows in DynamoDB. After "successful" archival, `FallbackAuditLogReader` would still return those rows from the primary store, masking the S3 archive. This is the only review blocker requiring code change before merge (B2 is a documentation discrepancy).
+
+## Approach
+
+### 1. Add retry loop to `delete_logs`
+
+Inside the existing per-chunk loop (`audit_logging.py:185-191`):
+
+- Capture the response from `batch_write_item`.
+- Read `response.get("UnprocessedItems") or {}`.
+- If non-empty, re-issue with the unprocessed map (do NOT rebuild from scratch — AWS returns the same shape we sent).
+- Cap at 5 attempts with exponential backoff (`time.sleep(min(2**attempt * 0.1, 2.0))`).
+- On exhaustion, raise `RuntimeError(f"BatchWriteItem still has unprocessed deletes for {self.table_name} after {max_attempts} attempts")` so the broad-`except` in `process_request` catches it and the next invocation retries the whole archive (idempotent — S3 overwrite is safe and `delete_logs` retried on already-gone keys is a no-op).
+
+`time` is not yet imported in this module — add `import time` at the top.
+
+Use module-level `Final` constants for both knobs so they are discoverable:
+
+```python
+DYNAMO_BATCH_WRITE_MAX_ITEMS: Final[int] = 25  # AWS hard limit
+DYNAMO_BATCH_WRITE_MAX_ATTEMPTS: Final[int] = 5
+```
+
+### 2. Test additions in `tests/test_audit_logging.py`
+
+- **Unit**: extend `StubDynamoDBClient.batch_write_item` to take a queue of pre-canned responses (so the first call returns `UnprocessedItems` and the second returns `{}`). Add a test asserting:
+  - `batch_write_item` is called twice.
+  - The second call's `RequestItems` is exactly the `UnprocessedItems` from the first response.
+  - The function returns successfully.
+- **Unit**: a separate test where the stub returns a non-empty `UnprocessedItems` for all attempts; assert `RuntimeError` is raised after the configured cap.
+- Patch `time.sleep` with `monkeypatch.setattr` so the tests don't actually sleep.
+
+### 3. No changes needed elsewhere
+
+- `AuditArchiver.archive` already lets `delete_logs` raise — the existing `try/except` in `process_request` will log and move on, and the next ticket-driven invocation can retry. No call-site change required.
+- moto-backed integration tests in `test_dynamodb_audit_logger.py` will not exercise the retry path (moto never returns `UnprocessedItems`), but the existing `test_delete_logs_*` tests still pass — verifying the happy path is unbroken.
+
+## Critical files
+
+- `src/dns_de_rte_orchestrator/audit_logging.py` — add `import time`, two `Final` constants, retry loop in `delete_logs`.
+- `tests/test_audit_logging.py` — extend `StubDynamoDBClient`, add two retry tests.
+
+## Reuse — do NOT re-implement
+
+- Existing `StubDynamoDBClient` pattern in `tests/test_audit_logging.py:48-67` — extend the `batch_write_item` method to support a queue of return values. Don't introduce a new stub class.
+- Existing `Final[int]` / `Literal` constant pattern at the bottom of `audit_logging.py:247-256` (`DYNAMO_DB_AUDIT_LOGGING_TABLE`, etc.) — keep new constants in the same neighbourhood.
+
+## Verification
+
+1. `uv run pytest tests/test_audit_logging.py tests/test_dynamodb_audit_logger.py -v` — happy path tests still pass; two new retry tests pass.
+2. `uv run basedpyright` — 0 errors, 0 warnings.
+3. `uv run pytest` — full suite green.
+4. Skip `sam` validation: no template changes.

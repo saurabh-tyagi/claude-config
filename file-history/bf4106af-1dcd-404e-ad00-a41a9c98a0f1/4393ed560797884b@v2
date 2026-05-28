@@ -1,0 +1,112 @@
+from collections.abc import Generator
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Literal
+
+import boto3
+import pytest
+from moto import mock_aws
+
+from dns_de_rte_orchestrator.audit_logging import (
+    AuditEntry,
+    S3AuditLogReader,
+    S3AuditLogWriter,
+)
+
+if TYPE_CHECKING:
+    from types_boto3_s3.client import S3Client
+
+TEST_BUCKET: Literal["test-archive-bucket"] = "test-archive-bucket"
+TEST_PREFIX: Literal["archived-logs"] = "archived-logs"
+
+
+def _s3_client() -> "S3Client":
+    return boto3.client("s3", region_name="eu-west-1")
+
+
+@pytest.fixture
+def s3_bucket() -> Generator[None, None, None]:
+    with mock_aws():
+        s3 = _s3_client()
+        _ = s3.create_bucket(
+            Bucket=TEST_BUCKET,
+            CreateBucketConfiguration={"LocationConstraint": "eu-west-1"},
+        )
+        yield
+
+
+def build_writer() -> S3AuditLogWriter:
+    return S3AuditLogWriter(
+        bucket=TEST_BUCKET, prefix=TEST_PREFIX, s3_client=_s3_client()
+    )
+
+
+def build_reader() -> S3AuditLogReader:
+    return S3AuditLogReader(
+        bucket=TEST_BUCKET, prefix=TEST_PREFIX, s3_client=_s3_client()
+    )
+
+
+@pytest.mark.usefixtures("s3_bucket")
+def test_write_then_read_round_trips_entries() -> None:
+    ts1 = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 5, 7, 11, 0, 0, tzinfo=timezone.utc)
+    ts3 = datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc)
+    original = [
+        AuditEntry(id="req-1", timestamp=ts1, message="first"),
+        AuditEntry(id="req-1", timestamp=ts2, message="second"),
+        AuditEntry(id="req-1", timestamp=ts3, message="third"),
+    ]
+
+    build_writer().write("req-1", original)
+    result = build_reader().get_logs("req-1")
+
+    assert result == original
+
+
+@pytest.mark.usefixtures("s3_bucket")
+def test_write_then_read_preserves_timestamps() -> None:
+    ts = datetime(2026, 5, 7, 14, 30, 45, tzinfo=timezone.utc)
+    entry = AuditEntry(id="req-ts", timestamp=ts, message="check timestamp")
+
+    build_writer().write("req-ts", [entry])
+    result = build_reader().get_logs("req-ts")
+
+    assert len(result) == 1
+    assert result[0].timestamp == ts
+
+
+@pytest.mark.usefixtures("s3_bucket")
+def test_write_uses_expected_s3_key() -> None:
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    build_writer().write("req-key", [AuditEntry(id="req-key", timestamp=ts, message="m")])
+
+    s3 = _s3_client()
+    response = s3.get_object(Bucket=TEST_BUCKET, Key=f"{TEST_PREFIX}/req-key.jsonl.gz")
+    assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+
+@pytest.mark.usefixtures("s3_bucket")
+def test_overwrite_replaces_existing_object() -> None:
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    writer = build_writer()
+
+    writer.write("req-ow", [AuditEntry(id="req-ow", timestamp=ts, message="original")])
+    writer.write("req-ow", [AuditEntry(id="req-ow", timestamp=ts, message="updated")])
+
+    result = build_reader().get_logs("req-ow")
+    assert len(result) == 1
+    assert result[0].message == "updated"
+
+
+@pytest.mark.usefixtures("s3_bucket")
+def test_write_empty_prefix_places_object_at_root() -> None:
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    s3 = _s3_client()
+    writer = S3AuditLogWriter(bucket=TEST_BUCKET, prefix="", s3_client=s3)
+
+    writer.write("req-root", [AuditEntry(id="req-root", timestamp=ts, message="root")])
+
+    reader = S3AuditLogReader(bucket=TEST_BUCKET, prefix="", s3_client=s3)
+    result = reader.get_logs("req-root")
+    assert len(result) == 1
+    assert result[0].message == "root"

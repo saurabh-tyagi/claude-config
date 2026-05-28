@@ -1,0 +1,621 @@
+import gzip
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any, cast
+from unittest.mock import MagicMock
+
+import pytest
+from pytest import MonkeyPatch
+from types_boto3_dynamodb.client import DynamoDBClient
+
+from dns_de_rte_orchestrator.audit_logging import (
+    AUDIT_LOG_S3_BUCKET,
+    AUDIT_LOG_S3_PREFIX,
+    DYNAMO_DB_AUDIT_LOGGING_TABLE,
+    AuditEntry,
+    DynamoDBAuditLogger,
+    FallbackAuditLogReader,
+    InMemoryAuditLogger,
+    NoOpAuditLogger,
+    S3AuditLogReader,
+    get_audit_log_reader,
+    get_audit_logger,
+    get_dynamodb_audit_logger,
+    get_s3_audit_log_reader,
+)
+
+_DdbPage = dict[str, Any]  # pyright: ignore[reportExplicitAny]
+
+
+class StubDynamoDBPaginator:
+    _pages: list[_DdbPage]
+
+    def __init__(self, pages: list[_DdbPage]) -> None:
+        self._pages = pages
+        self._last_kwargs: _DdbPage = {}
+
+    def paginate(self, **kwargs: object) -> list[_DdbPage]:
+        self._last_kwargs = dict(kwargs)
+        return self._pages
+
+
+class StubDynamoDBClient:
+    _query_pages: list[_DdbPage]
+
+    def __init__(self, query_pages: list[_DdbPage] | None = None) -> None:
+        self.put_item_calls: list[dict[str, object]] = []
+        self._query_pages = query_pages or []
+        self._paginator: StubDynamoDBPaginator | None = None
+
+    def put_item(self, **kwargs: object) -> dict[str, object]:
+        self.put_item_calls.append(kwargs)
+        return {}
+
+    def get_paginator(self, operation: str) -> StubDynamoDBPaginator:
+        assert operation == "query"
+        self._paginator = StubDynamoDBPaginator(self._query_pages)
+        return self._paginator
+
+
+def stub_get_dynamodb_audit_logger(
+    table_name: str, expected: DynamoDBAuditLogger
+) -> DynamoDBAuditLogger:
+    assert table_name == "audit-table"
+    return expected
+
+
+def stub_boto3_client(
+    service_name: str, client: StubDynamoDBClient
+) -> StubDynamoDBClient:
+    assert service_name == "dynamodb"
+    return client
+
+
+def _make_gzipped_jsonl(entries: list[dict[str, str]]) -> bytes:
+    lines = "\n".join(json.dumps(e) for e in entries)
+    return gzip.compress(lines.encode("utf-8"))
+
+
+# --- NoOpAuditLogger ---
+
+
+def test_no_op_log():
+    audit = NoOpAuditLogger()
+    audit.log("id", "message")
+
+
+def test_no_op_get_logs_returns_empty():
+    audit = NoOpAuditLogger()
+    assert audit.get_logs("any-id") == []
+
+
+# --- InMemoryAuditLogger ---
+
+
+def test_in_memory_log():
+    before_tests = datetime.now(timezone.utc)
+    audit = InMemoryAuditLogger()
+
+    assert len(audit.memory_log) == 0
+
+    id = "foobar"
+    message = "test message1"
+    timestamp = datetime.now(timezone.utc)
+
+    audit.log(id, message, timestamp)
+    assert len(audit.memory_log) == 1
+    assert audit.memory_log[0] == ((id, timestamp), message)
+
+    message = "message 2"
+    audit.log(id, message)
+    assert len(audit.memory_log) == 2
+    found_entry = audit.memory_log[1]
+    assert found_entry[0][1] >= before_tests
+    assert found_entry[0][0] == id
+    assert found_entry[1] == message
+
+
+def test_in_memory_log_change_timezone():
+    audit = InMemoryAuditLogger()
+    assert len(audit.memory_log) == 0
+
+    original_tz = timezone(timedelta(hours=12))
+    timestamp = datetime.now(original_tz)
+    id = "baz"
+    message = "testing"
+
+    audit.log(id, message, timestamp)
+    assert len(audit.memory_log) == 1
+
+    assert audit.memory_log[0] != ((id, timestamp), message)
+    utc_timestamp = timestamp.replace(tzinfo=timezone.utc)
+    assert audit.memory_log[0] == ((id, utc_timestamp), message)
+
+
+def test_in_memory_get_logs_returns_entries_for_id():
+    audit = InMemoryAuditLogger()
+    ts1 = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+    audit.log("req-1", "first", ts1)
+    audit.log("req-2", "other", ts1)
+    audit.log("req-1", "second", ts2)
+
+    results = audit.get_logs("req-1")
+
+    assert len(results) == 2
+    assert results[0].message == "first"
+    assert results[1].message == "second"
+
+
+def test_in_memory_get_logs_returns_chronological_order():
+    audit = InMemoryAuditLogger()
+    ts_late = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    ts_early = datetime(2026, 1, 1, 9, 0, 0, tzinfo=timezone.utc)
+    # Log out of order
+    audit.log("req-1", "late message", ts_late)
+    audit.log("req-1", "early message", ts_early)
+
+    results = audit.get_logs("req-1")
+
+    assert [e.message for e in results] == ["early message", "late message"]
+
+
+def test_in_memory_get_logs_returns_empty_for_unknown_id():
+    audit = InMemoryAuditLogger()
+    audit.log("req-1", "some message")
+
+    assert audit.get_logs("unknown-id") == []
+
+
+# --- DynamoDBAuditLogger ---
+
+
+def test_dynamodb_audit_logger_create_item_serializes_fields():
+    timestamp = datetime(2026, 5, 7, 14, 30, 45, 123000, tzinfo=timezone.utc)
+
+    item = DynamoDBAuditLogger._create_item(  # pyright: ignore[reportPrivateUsage]
+        "req-123", "audit message", timestamp
+    )
+
+    assert item == {
+        "id": {"S": "req-123"},
+        "timestamp": {"N": "1778164245123"},
+        "message": {"S": "audit message"},
+    }
+
+
+def test_dynamodb_audit_logger_log_calls_put_item_with_serialized_item():
+    client = StubDynamoDBClient()
+    logger = DynamoDBAuditLogger(
+        table_name="audit-table",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+    timestamp = datetime(2026, 5, 7, 14, 30, 45, tzinfo=timezone.utc)
+
+    logger.log("req-123", "audit message", timestamp)
+
+    assert client.put_item_calls == [
+        {
+            "TableName": "audit-table",
+            "Item": {
+                "id": {"S": "req-123"},
+                "timestamp": {"N": "1778164245000"},
+                "message": {"S": "audit message"},
+            },
+            "ReturnValues": "NONE",
+        }
+    ]
+
+
+def test_dynamodb_audit_logger_log_relabels_non_utc_timestamp_before_writing():
+    client = StubDynamoDBClient()
+    logger = DynamoDBAuditLogger(
+        table_name="audit-table",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+    original_tz = timezone(timedelta(hours=12))
+    timestamp = datetime(2026, 5, 7, 14, 30, 45, tzinfo=original_tz)
+
+    logger.log("req-123", "audit message", timestamp)
+
+    assert client.put_item_calls == [
+        {
+            "TableName": "audit-table",
+            "Item": DynamoDBAuditLogger._create_item(  # pyright: ignore[reportPrivateUsage]
+                "req-123",
+                "audit message",
+                timestamp.replace(tzinfo=timezone.utc),
+            ),
+            "ReturnValues": "NONE",
+        }
+    ]
+
+
+def test_dynamodb_audit_logger_get_logs_queries_by_id():
+    ts_ms = 1778164245000
+    pages = [
+        {
+            "Items": [
+                {
+                    "id": {"S": "req-1"},
+                    "timestamp": {"N": str(ts_ms)},
+                    "message": {"S": "msg"},
+                },
+            ]
+        }
+    ]
+    client = StubDynamoDBClient(query_pages=pages)
+    logger = DynamoDBAuditLogger(
+        table_name="audit-table",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+
+    results = logger.get_logs("req-1")
+
+    assert len(results) == 1
+    assert results[0].id == "req-1"
+    assert results[0].message == "msg"
+    expected_ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    assert results[0].timestamp == expected_ts
+
+    assert client._paginator is not None  # pyright: ignore[reportPrivateUsage]
+    last_kwargs = client._paginator._last_kwargs  # pyright: ignore[reportPrivateUsage]
+    assert last_kwargs["KeyConditionExpression"] == "#id = :id"
+    assert last_kwargs["ExpressionAttributeValues"] == {":id": {"S": "req-1"}}
+    assert last_kwargs["ScanIndexForward"] is True
+
+
+def test_dynamodb_audit_logger_get_logs_paginates():
+    ts1 = 1778164245000
+    ts2 = 1778164305000
+    pages = [
+        {
+            "Items": [
+                {
+                    "id": {"S": "req-1"},
+                    "timestamp": {"N": str(ts1)},
+                    "message": {"S": "first"},
+                }
+            ]
+        },
+        {
+            "Items": [
+                {
+                    "id": {"S": "req-1"},
+                    "timestamp": {"N": str(ts2)},
+                    "message": {"S": "second"},
+                }
+            ]
+        },
+    ]
+    client = StubDynamoDBClient(query_pages=pages)
+    logger = DynamoDBAuditLogger(
+        table_name="audit-table",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+
+    results = logger.get_logs("req-1")
+
+    assert [e.message for e in results] == ["first", "second"]
+
+
+def test_dynamodb_audit_logger_get_logs_returns_empty_when_no_items():
+    client = StubDynamoDBClient(query_pages=[{"Items": []}])
+    logger = DynamoDBAuditLogger(
+        table_name="audit-table",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+
+    assert logger.get_logs("req-1") == []
+
+
+def test_dynamodb_audit_logger_get_logs_handles_page_without_items_key():
+    client = StubDynamoDBClient(query_pages=[{}])
+    logger = DynamoDBAuditLogger(
+        table_name="audit-table",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+
+    assert logger.get_logs("req-1") == []
+
+
+# --- AuditEntry ---
+
+
+def test_audit_entry_to_json():
+    ts = datetime(2026, 5, 7, 14, 30, 45, tzinfo=timezone.utc)
+    entry = AuditEntry(id="req-1", timestamp=ts, message="hello")
+
+    result = entry.to_json()
+
+    assert result == {
+        "id": "req-1",
+        "timestamp": "2026-05-07T14:30:45+00:00",
+        "message": "hello",
+    }
+
+
+# --- S3AuditLogReader ---
+
+
+def _make_stub_s3(  # pyright: ignore[reportAny]
+    body: bytes | None = None, error_code: str | None = None
+) -> Any:  # pyright: ignore[reportExplicitAny]
+    """Return a minimal stub for boto3 S3 client."""
+    from botocore.exceptions import ClientError
+
+    stub = MagicMock()
+    if error_code:
+        stub.get_object.side_effect = ClientError(  # pyright: ignore[reportAny]
+            {"Error": {"Code": error_code, "Message": ""}}, "GetObject"
+        )
+    elif body is not None:
+        response_body = MagicMock()
+        response_body.read.return_value = body  # pyright: ignore[reportAny]
+        stub.get_object.return_value = {  # pyright: ignore[reportAny]
+            "Body": response_body
+        }
+    return stub
+
+
+def test_s3_reader_returns_entries_from_gzipped_jsonl():
+    ts = "2026-05-07T14:30:45+00:00"
+    data = _make_gzipped_jsonl(
+        [
+            {"id": "req-1", "timestamp": ts, "message": "first"},
+            {
+                "id": "req-1",
+                "timestamp": "2026-05-07T15:00:00+00:00",
+                "message": "second",
+            },
+        ]
+    )
+    s3 = _make_stub_s3(body=data)  # pyright: ignore[reportAny]
+    reader = S3AuditLogReader(
+        bucket="my-bucket", prefix="audit", s3_client=s3  # pyright: ignore[reportAny]
+    )
+
+    results = reader.get_logs("req-1")
+
+    assert len(results) == 2
+    assert results[0].message == "first"
+    assert results[1].message == "second"
+    s3.get_object.assert_called_once_with(  # pyright: ignore[reportAny]
+        Bucket="my-bucket", Key="audit/req-1.jsonl.gz"
+    )
+
+
+def test_s3_reader_uses_prefix_in_key():
+    data = _make_gzipped_jsonl(
+        [{"id": "x", "timestamp": "2026-01-01T00:00:00+00:00", "message": "m"}]
+    )
+    s3 = _make_stub_s3(body=data)  # pyright: ignore[reportAny]
+    reader = S3AuditLogReader(
+        bucket="bucket",
+        prefix="some/prefix",
+        s3_client=s3,  # pyright: ignore[reportAny]
+    )
+
+    _ = reader.get_logs("x")
+
+    s3.get_object.assert_called_once_with(  # pyright: ignore[reportAny]
+        Bucket="bucket", Key="some/prefix/x.jsonl.gz"
+    )
+
+
+def test_s3_reader_strips_trailing_slash_from_prefix():
+    data = _make_gzipped_jsonl(
+        [{"id": "x", "timestamp": "2026-01-01T00:00:00+00:00", "message": "m"}]
+    )
+    s3 = _make_stub_s3(body=data)  # pyright: ignore[reportAny]
+    reader = S3AuditLogReader(
+        bucket="bucket",
+        prefix="some/prefix/",
+        s3_client=s3,  # pyright: ignore[reportAny]
+    )
+
+    _ = reader.get_logs("x")
+
+    s3.get_object.assert_called_once_with(  # pyright: ignore[reportAny]
+        Bucket="bucket", Key="some/prefix/x.jsonl.gz"
+    )
+
+
+def test_s3_reader_empty_prefix_omits_slash():
+    data = _make_gzipped_jsonl(
+        [{"id": "x", "timestamp": "2026-01-01T00:00:00+00:00", "message": "m"}]
+    )
+    s3 = _make_stub_s3(body=data)  # pyright: ignore[reportAny]
+    reader = S3AuditLogReader(
+        bucket="bucket", prefix="", s3_client=s3  # pyright: ignore[reportAny]
+    )
+
+    _ = reader.get_logs("x")
+
+    s3.get_object.assert_called_once_with(  # pyright: ignore[reportAny]
+        Bucket="bucket", Key="x.jsonl.gz"
+    )
+
+
+def test_s3_reader_returns_empty_on_no_such_key():
+    s3 = _make_stub_s3(error_code="NoSuchKey")  # pyright: ignore[reportAny]
+    reader = S3AuditLogReader(
+        bucket="bucket", prefix="pfx", s3_client=s3  # pyright: ignore[reportAny]
+    )
+
+    assert reader.get_logs("missing-id") == []
+
+
+def test_s3_reader_returns_empty_on_no_such_bucket():
+    s3 = _make_stub_s3(error_code="NoSuchBucket")  # pyright: ignore[reportAny]
+    reader = S3AuditLogReader(
+        bucket="bucket", prefix="pfx", s3_client=s3  # pyright: ignore[reportAny]
+    )
+
+    assert reader.get_logs("any-id") == []
+
+
+def test_s3_reader_propagates_other_client_errors():
+    s3 = _make_stub_s3(error_code="AccessDenied")  # pyright: ignore[reportAny]
+    reader = S3AuditLogReader(
+        bucket="bucket", prefix="pfx", s3_client=s3  # pyright: ignore[reportAny]
+    )
+
+    from botocore.exceptions import ClientError
+
+    with pytest.raises(ClientError):
+        _ = reader.get_logs("req-1")
+
+
+def test_s3_reader_raises_on_malformed_json():
+    bad_bytes = gzip.compress(
+        b'{"id": "x", "timestamp": "2026-01-01T00:00:00+00:00"\n{bad line'
+    )
+    s3 = _make_stub_s3(body=bad_bytes)  # pyright: ignore[reportAny]
+    reader = S3AuditLogReader(
+        bucket="bucket", prefix="pfx", s3_client=s3  # pyright: ignore[reportAny]
+    )
+
+    with pytest.raises(json.JSONDecodeError):
+        _ = reader.get_logs("x")
+
+
+# --- FallbackAuditLogReader ---
+
+
+def test_fallback_reader_returns_primary_when_non_empty():
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    primary = InMemoryAuditLogger()
+    primary.log("req-1", "primary entry", ts)
+
+    fallback_s3 = MagicMock(spec=S3AuditLogReader)
+
+    reader = FallbackAuditLogReader(primary=primary, fallback=fallback_s3)
+    results = reader.get_logs("req-1")
+
+    assert len(results) == 1
+    assert results[0].message == "primary entry"
+    fallback_s3.get_logs.assert_not_called()  # pyright: ignore[reportAny]
+
+
+def test_fallback_reader_falls_back_to_s3_when_primary_empty():
+    primary = InMemoryAuditLogger()
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    expected = [AuditEntry(id="req-1", timestamp=ts, message="s3 entry")]
+
+    fallback_s3 = MagicMock(spec=S3AuditLogReader)
+    fallback_s3.get_logs.return_value = expected  # pyright: ignore[reportAny]
+
+    reader = FallbackAuditLogReader(primary=primary, fallback=fallback_s3)
+    results = reader.get_logs("req-1")
+
+    assert results == expected
+    fallback_s3.get_logs.assert_called_once_with("req-1")  # pyright: ignore[reportAny]
+
+
+def test_fallback_reader_returns_empty_when_both_empty():
+    primary = InMemoryAuditLogger()
+    fallback_s3 = MagicMock(spec=S3AuditLogReader)
+    fallback_s3.get_logs.return_value = []  # pyright: ignore[reportAny]
+
+    reader = FallbackAuditLogReader(primary=primary, fallback=fallback_s3)
+    assert reader.get_logs("req-1") == []
+
+
+# --- Factory functions ---
+
+
+def test_get_audit_logger_returns_noop_logger_without_env(monkeypatch: MonkeyPatch):
+    monkeypatch.delenv(DYNAMO_DB_AUDIT_LOGGING_TABLE, raising=False)
+
+    logger = get_audit_logger()
+
+    assert isinstance(logger, NoOpAuditLogger)
+
+
+def test_get_audit_logger_returns_dynamodb_logger_when_env_set(
+    monkeypatch: MonkeyPatch,
+):
+    expected = DynamoDBAuditLogger(
+        table_name="audit-table",
+        dynamodb=cast(DynamoDBClient, cast(object, StubDynamoDBClient())),
+    )
+
+    def fake_get_dynamodb_audit_logger(table_name: str) -> DynamoDBAuditLogger:
+        return stub_get_dynamodb_audit_logger(table_name, expected)
+
+    monkeypatch.setenv(DYNAMO_DB_AUDIT_LOGGING_TABLE, "audit-table")
+    monkeypatch.setattr(
+        "dns_de_rte_orchestrator.audit_logging.get_dynamodb_audit_logger",
+        fake_get_dynamodb_audit_logger,
+    )
+
+    logger = get_audit_logger()
+
+    assert logger is expected
+
+
+def test_get_dynamodb_audit_logger_builds_boto3_client(monkeypatch: MonkeyPatch):
+    client = StubDynamoDBClient()
+
+    def fake_boto3_client(service_name: str) -> StubDynamoDBClient:
+        return stub_boto3_client(service_name, client)
+
+    monkeypatch.setattr(
+        "dns_de_rte_orchestrator.audit_logging.boto3.client",
+        fake_boto3_client,
+    )
+
+    logger = get_dynamodb_audit_logger("audit-table")
+
+    assert isinstance(logger, DynamoDBAuditLogger)
+    assert logger.table_name == "audit-table"
+    assert logger.dynamodb is client
+
+
+def test_get_s3_audit_log_reader_builds_boto3_client(monkeypatch: MonkeyPatch):
+    s3_stub = MagicMock()
+    calls: list[str] = []
+
+    def fake_boto3_client(  # pyright: ignore[reportAny]
+        service_name: str,
+    ) -> Any:  # pyright: ignore[reportExplicitAny]
+        calls.append(service_name)
+        return s3_stub
+
+    monkeypatch.setattr(
+        "dns_de_rte_orchestrator.audit_logging.boto3.client", fake_boto3_client
+    )
+
+    reader = get_s3_audit_log_reader("my-bucket", "my-prefix")
+
+    assert isinstance(reader, S3AuditLogReader)
+    assert reader.bucket == "my-bucket"
+    assert reader.prefix == "my-prefix"
+    assert "s3" in calls
+
+
+def test_get_audit_log_reader_raises_without_s3_bucket(monkeypatch: MonkeyPatch):
+    monkeypatch.delenv(AUDIT_LOG_S3_BUCKET, raising=False)
+    monkeypatch.setenv(AUDIT_LOG_S3_PREFIX, "pfx")
+
+    with pytest.raises(ValueError, match=AUDIT_LOG_S3_BUCKET):
+        _ = get_audit_log_reader()
+
+
+def test_get_audit_log_reader_uses_empty_prefix_by_default(monkeypatch: MonkeyPatch):
+    monkeypatch.setenv(AUDIT_LOG_S3_BUCKET, "my-bucket")
+    monkeypatch.delenv(AUDIT_LOG_S3_PREFIX, raising=False)
+    monkeypatch.setattr(
+        "dns_de_rte_orchestrator.audit_logging.boto3.client",
+        lambda _: MagicMock(),  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    monkeypatch.setattr(
+        "dns_de_rte_orchestrator.audit_logging.get_audit_logger",
+        lambda: NoOpAuditLogger(),
+    )
+
+    reader = get_audit_log_reader()
+
+    assert isinstance(reader, FallbackAuditLogReader)
+    assert reader.fallback.prefix == ""

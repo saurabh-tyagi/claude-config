@@ -1,0 +1,215 @@
+from collections.abc import Generator
+from datetime import datetime, timedelta, timezone
+from typing import Literal
+
+import boto3
+import pytest
+from boto3.dynamodb.conditions import Key
+from moto import mock_aws
+from types_boto3_dynamodb.service_resource import Table
+
+from dns_de_rte_orchestrator.audit_logging import AuditEntry, DynamoDBAuditLogger
+
+TEST_TABLE_NAME: Literal["test_audit_table"] = "test_audit_table"
+
+
+@pytest.fixture
+def dynamodb_table() -> Generator[Table, None, None]:
+    with mock_aws():
+        dynamodb = boto3.resource("dynamodb", region_name="eu-west-1")
+        table = dynamodb.create_table(
+            TableName=TEST_TABLE_NAME,
+            KeySchema=[
+                {"AttributeName": AuditEntry.ID_FIELD, "KeyType": "HASH"},
+                {
+                    "AttributeName": AuditEntry.TIMESTAMP_FIELD,
+                    "KeyType": "RANGE",
+                },
+            ],
+            AttributeDefinitions=[
+                {
+                    "AttributeName": AuditEntry.ID_FIELD,
+                    "AttributeType": "S",
+                },
+                {
+                    "AttributeName": AuditEntry.TIMESTAMP_FIELD,
+                    "AttributeType": "N",
+                },
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table.wait_until_exists()
+        yield table
+
+
+def build_audit_logger() -> DynamoDBAuditLogger:
+    client = boto3.client("dynamodb", region_name="us-east-1")
+    return DynamoDBAuditLogger(
+        table_name=TEST_TABLE_NAME,
+        dynamodb=client,
+    )
+
+
+def test_log_persists_item_with_explicit_timestamp(dynamodb_table: Table):
+    logger = build_audit_logger()
+    timestamp = datetime(2026, 5, 7, 14, 30, 45, 123000, tzinfo=timezone.utc)
+
+    logger.log("req-123", "audit message", timestamp)
+
+    result = dynamodb_table.get_item(
+        Key={
+            AuditEntry.ID_FIELD: "req-123",
+            AuditEntry.TIMESTAMP_FIELD: int(timestamp.timestamp() * 1000),
+        }
+    )
+
+    assert "Item" in result
+    item = result["Item"]
+    assert item[AuditEntry.ID_FIELD] == "req-123"
+    assert str(item[AuditEntry.TIMESTAMP_FIELD]) == "1778164245123"
+    assert item[AuditEntry.MESSAGE_FIELD] == "audit message"
+
+
+def test_log_persists_item_with_generated_utc_timestamp(dynamodb_table: Table):
+    logger = build_audit_logger()
+    before = datetime.now(timezone.utc)
+
+    logger.log("req-456", "generated timestamp message")
+
+    after = datetime.now(timezone.utc)
+    result = dynamodb_table.scan()
+
+    assert "Items" in result
+    items = [item for item in result["Items"] if item[AuditEntry.ID_FIELD] == "req-456"]
+    assert len(items) == 1
+    item = items[0]
+    assert item[AuditEntry.MESSAGE_FIELD] == "generated timestamp message"
+    timestamp_ms = int(str(item[AuditEntry.TIMESTAMP_FIELD]))
+    assert timestamp_ms >= int(before.timestamp() * 1000)
+    assert timestamp_ms <= int(after.timestamp() * 1000)
+
+
+def test_log_relabels_non_utc_timezone_before_persisting(dynamodb_table: Table):
+    logger = build_audit_logger()
+    original_tz = timezone(timedelta(hours=12))
+    timestamp = datetime(2026, 5, 7, 14, 30, 45, tzinfo=original_tz)
+    expected_timestamp_ms = int(
+        timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000
+    )
+
+    logger.log("req-789", "timezone message", timestamp)
+
+    result = dynamodb_table.get_item(
+        Key={
+            AuditEntry.ID_FIELD: "req-789",
+            AuditEntry.TIMESTAMP_FIELD: expected_timestamp_ms,
+        }
+    )
+
+    assert "Item" in result
+    item = result["Item"]
+    assert str(item[AuditEntry.TIMESTAMP_FIELD]) == str(expected_timestamp_ms)
+    assert item[AuditEntry.MESSAGE_FIELD] == "timezone message"
+
+
+def test_log_allows_multiple_entries_for_same_id(dynamodb_table: Table):
+    logger = build_audit_logger()
+    first_timestamp = datetime(2026, 5, 7, 14, 30, 45, tzinfo=timezone.utc)
+    second_timestamp = datetime(2026, 5, 7, 14, 31, 45, tzinfo=timezone.utc)
+
+    logger.log("req-repeat", "first message", first_timestamp)
+    logger.log("req-repeat", "second message", second_timestamp)
+
+    result = dynamodb_table.query(
+        KeyConditionExpression=Key(AuditEntry.ID_FIELD).eq("req-repeat")
+    )
+
+    assert "Items" in result
+    items = result["Items"]
+    assert len(items) == 2
+    assert [item[AuditEntry.MESSAGE_FIELD] for item in items] == [
+        "first message",
+        "second message",
+    ]
+
+
+@pytest.mark.usefixtures("dynamodb_table")
+def test_get_logs_returns_chronological_entries():
+    logger = build_audit_logger()
+    ts1 = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 5, 7, 11, 0, 0, tzinfo=timezone.utc)
+    ts3 = datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    logger.log("req-chrono", "first", ts1)
+    logger.log("req-chrono", "third", ts3)
+    logger.log("req-chrono", "second", ts2)
+
+    results = logger.get_logs("req-chrono")
+
+    assert len(results) == 3
+    assert [e.message for e in results] == ["first", "second", "third"]
+    assert results[0].timestamp == ts1
+    assert results[1].timestamp == ts2
+    assert results[2].timestamp == ts3
+
+
+@pytest.mark.usefixtures("dynamodb_table")
+def test_get_logs_returns_only_entries_for_requested_id():
+    logger = build_audit_logger()
+    ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+    logger.log("req-a", "entry for a", ts)
+    logger.log("req-b", "entry for b", ts)
+
+    results = logger.get_logs("req-a")
+
+    assert len(results) == 1
+    assert results[0].id == "req-a"
+    assert results[0].message == "entry for a"
+
+
+@pytest.mark.usefixtures("dynamodb_table")
+def test_get_logs_returns_empty_for_unknown_id():
+    logger = build_audit_logger()
+
+    assert logger.get_logs("no-such-id") == []
+
+
+@pytest.mark.usefixtures("dynamodb_table")
+def test_delete_logs_removes_all_entries_for_id():
+    logger = build_audit_logger()
+    ts1 = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 5, 7, 11, 0, 0, tzinfo=timezone.utc)
+
+    logger.log("req-del", "first", ts1)
+    logger.log("req-del", "second", ts2)
+    assert len(logger.get_logs("req-del")) == 2
+
+    logger.delete_logs("req-del")
+
+    assert logger.get_logs("req-del") == []
+
+
+@pytest.mark.usefixtures("dynamodb_table")
+def test_delete_logs_does_not_affect_other_ids():
+    logger = build_audit_logger()
+    ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+    logger.log("req-keep", "stay", ts)
+    logger.log("req-gone", "go", ts)
+
+    logger.delete_logs("req-gone")
+
+    assert logger.get_logs("req-gone") == []
+    assert len(logger.get_logs("req-keep")) == 1
+
+
+@pytest.mark.usefixtures("dynamodb_table")
+def test_delete_logs_noop_for_unknown_id():
+    logger = build_audit_logger()
+    ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
+    logger.log("req-existing", "entry", ts)
+
+    logger.delete_logs("no-such-id")
+
+    assert len(logger.get_logs("req-existing")) == 1

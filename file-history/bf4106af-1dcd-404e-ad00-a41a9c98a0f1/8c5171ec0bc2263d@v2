@@ -1,0 +1,76 @@
+# TODO List
+
+This file contains a checklist of things to do for the RTE Orchestration
+project. It is intended to help guide human and AI agents:
+
+- [x] Create project skeleton using `uv`
+- [x] Add `README.md`
+- [x] Add `AGENTS.md` and link `CLAUDE.md` to it
+- [x] Set up `pre-commit` or `prek` to ensure code quality
+- [x] Set up linting and code quality tools
+  - [x] `basedpyright` for type checking
+  - [x] `ruff` for general linting
+  - [x] `black` for formatting
+  - [x] Make sure all are added to prek where possible
+- [x] Make sure `pytest` works
+- [x] Add code coverage plugin for tests
+- [x] Document how to use `uv` and other tools in README in case people are
+  unfamiliar
+- [x] Add type stubs for `boto3` since AWS does not provide them
+- [x] Implement storage layer
+  - [x] Add basic interface/abstract class for storage repository
+  - [x] Add an example in-memory implementation to validate ideas and test with
+  - [x] Add tests for in-memory implementation
+  - [x] Add AWS DynamoDB implementation
+    - [x] Implement converting domain object to DynamoDB request
+    - [x] Implement converting DynamoDB response back to a domain object
+    - [x] Implement creating entries
+    - [x] Implement updating entries
+    - [x] Implement getting single entries
+    - [x] Implement getting all entries in a given state
+    - [x] Implement creating a DynamoDB based repository from environment
+      variables
+  - [x] Add tests for DynamoDB implementation
+    - [x] Tests for creating items
+    - [x] Tests for updating items
+    - [x] Tests for getting single items
+    - [x] Tests for environment variables
+    - [x] Tests for getting all entries in a given state
+- [ ] Implement processing business logic
+  - [x] Add skeleton of processing code
+  - [x] Wire up storage layer type to processing code
+  - [ ] Implement business logic
+    - [x] Handle new erasure requests
+    - [ ] Handle phase 1 erasure requests
+    - [ ] Handle phase 2 erasure requests
+    - [ ] Handle phase 3 erasure requests
+- [ ] Add OneTrust updater
+  - [x] Add unit tests for the OneTrust updater
+- [ ] Update the Customer API code to use requests library instead of urllib
+- [ ] Add tests for business logic
+- [x] Add Lambda code for creating an item
+- [x] Add Lambda code for triggering process of all items
+- [x] Add audit logging
+  - [x] Add audit logging implementation that uses DynamoDB
+  - [x] Add audit logging calls to existing code
+  - [x] Add audit logging tests
+  - [x] Add audit logging retrieval
+    - [x] Create an API endpoint to get audit log for an erasure id
+    - [x] Create a new lambda to handle audit retrieval functionality
+  - [x] Add audit logging materialising to S3 after successful erasure
+- [x] Add `.gitlab-ci.yml` and enable GitLab CI/CD
+- [x] Make sure tests are run in CI/CD
+- [x] Make sure tests only run in CI/CD when code changes happen
+- [x] Make sure linting and other code quality tools are run as part of CI/CD
+- [ ] Add AWS SAM deployment configuration
+  - [x] Add Create Lambda to `template.yaml`
+  - [x] Add API Gateway in front of Create Lambda (private, VPCE-restricted)
+  - [x] Add Process Lambda to `template.yaml`
+  - [x] Get SAM to not package the whole repo as an artifact to send to AWS
+  - [x] Add `sam validate` step to CI/CD
+  - [x] Add `sam build` step to CI/CD
+  - [x] Add `sam deploy` steps to CI/CD
+  - [ ] Fix `sam delete` step in CI/CD so it doesn't prompt for user input
+- [x] Make sure AWS SAM deployment can be done from CI/CD to `dev` and `prod`
+  - [x] Confirm AWS SAM deployment can be done to `dev` via CI/CD
+  - [x] Confirm AWS SAM deployment can be done to `prod` via CI/CD

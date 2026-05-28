@@ -1,0 +1,20 @@
+{
+  "httpMethod": "GET",
+  "path": "/status/",
+  "pathParameters": null,
+  "queryStringParameters": null,
+  "multiValueQueryStringParameters": null,
+  "headers": {
+    "Accept": "application/json",
+    "x-api-key": "local-dev-api-key"
+  },
+  "multiValueHeaders": {},
+  "requestContext": {
+    "resourcePath": "/status/{id}",
+    "httpMethod": "GET",
+    "stage": "local",
+    "requestId": "local-debug-missing-id"
+  },
+  "body": null,
+  "isBase64Encoded": false
+}

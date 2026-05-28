@@ -1,0 +1,192 @@
+# DATA-4715 — Archive audit logs to S3 on successful erasure
+
+## Context
+
+Today every audit log entry for an erasure request lives only in the DynamoDB
+audit log table (`AuditLogDynamoDBTable`). The reporter Lambda already supports
+reading from S3 via `FallbackAuditLogReader` (`get_logs` tries DynamoDB first,
+then falls back to a gzipped JSONL object at
+`s3://{AuditLogS3Bucket}/{AuditLogS3Prefix}/{id}.jsonl.gz`), but **nothing
+ever writes to that S3 location yet** — the S3 read path is dead until this
+ticket lands.
+
+This change introduces the missing writer: when a request finishes processing
+successfully (terminal state `done`), the processor will materialise that id's
+complete audit log to S3 and then delete the corresponding rows from the
+DynamoDB audit table. After archival, reads are served by the S3 fallback
+unchanged — no reader code needs to change. This satisfies the open TODO at
+`TODO.md:60` and unblocks shrinking the hot DynamoDB table.
+
+## Approach
+
+Three small additions, one wiring change, one IAM/template change.
+
+### 1. Writer + deleter — `src/dns_de_rte_orchestrator/audit_logging.py`
+
+Add an `S3AuditLogWriter` that is the symmetric counterpart of the existing
+`S3AuditLogReader` (same bucket, same prefix, same `_key_for(id)`,
+`{prefix}/{id}.jsonl.gz`). It serialises a `list[AuditEntry]` to gzipped
+JSON Lines using `entry.to_json()` (one JSON object per line, exactly what the
+reader expects on `splitlines()`) and `put_object`s to the same key. Keep the
+key-formatting logic in one place by either sharing a small helper or reusing
+the reader's `_key_for`.
+
+Add `delete_logs(id: str) -> None` to `DynamoDBAuditLogger`. It paginates the
+existing query, collects the composite keys `{id, timestamp}`, and removes
+them via `BatchWriteItem` in chunks of 25. Idempotent — deletes for missing
+items are no-ops.
+
+Add a factory `get_s3_audit_log_writer(bucket, prefix)` next to
+`get_s3_audit_log_reader` and a top-level `get_audit_log_archiver()` that
+returns the new `AuditArchiver` (next item) wired up from env vars
+`AUDIT_LOG_S3_BUCKET` / `AUDIT_LOG_S3_PREFIX` /
+`DYNAMO_DB_AUDIT_LOGGING_TABLE`. Reuse the existing env constants — do not
+introduce new ones.
+
+### 2. New `AuditArchiver` — `src/dns_de_rte_orchestrator/audit_logging.py`
+
+```
+class AuditArchiver:
+    def __init__(self, primary: DynamoDBAuditLogger, writer: S3AuditLogWriter): ...
+    def archive(self, id: str) -> None:
+        entries = self.primary.get_logs(id)
+        if not entries:
+            return  # nothing to archive — safe no-op
+        self.writer.write(id, entries)        # S3 PutObject; raises on failure
+        self.primary.delete_logs(id)          # only runs after S3 confirms
+```
+
+Order is critical: **S3 first, then Dynamo delete**. If the delete fails
+mid-way, FallbackAuditLogReader still returns the (complete) Dynamo copy, so
+the system is never in a state where reads return nothing. A retry of
+`archive(id)` is safe — overwrite to S3, batch-delete tolerates already-gone
+items.
+
+### 3. Wire archival into the processor — `src/dns_de_rte_orchestrator/request_processor.py`
+
+- Inject `archiver: AuditArchiver | None` into `RequestProcessor.__init__`
+  (`processor_lambda.py:51` constructs it; pass
+  `get_audit_log_archiver()` there). Optional so unit tests and dry-run paths
+  can pass `None`.
+- At the end of `process_request`, after the `match` returns successfully,
+  check `request.state == "done"` and (when not dry-run and `archiver` is set)
+  call `archiver.archive(request.id)`. Wrap in a `try/except` that logs the
+  failure but does not re-raise — the request itself is already `done`, so
+  failing the archival should not flip success metrics for this run; a
+  follow-up invocation can retry (see follow-up note below).
+
+This honours the user's instruction to trigger archival "after
+`process_request()` successfully completes" — the call lives at the tail of
+`process_request`, not inside `_transition_request` and not in
+`process_phase3`.
+
+### 4. Reader stays untouched
+
+`FallbackAuditLogReader.get_logs` already does "primary (Dynamo) wins, else
+S3". Because archival writes the **identical** gzipped JSONL format the
+reader already consumes (`audit_logging.py:207–227`), the reporter Lambda
+continues to work seamlessly without any code change.
+
+### 5. SAM template — `template.yaml`
+
+Mirror the existing `ReporterS3ReadPolicy` pattern (`template.yaml:203–214`)
+for the process Lambda:
+
+- Add a `ProcessS3WritePolicy` (`AWS::IAM::Policy`) granting `s3:PutObject`
+  on `arn:aws:s3:::${AuditLogS3Bucket}/${AuditLogS3Prefix}/*` to
+  `ProcessServerlessAccessManager.LambdaExecutionRoleName`.
+- Add `AUDIT_LOG_S3_BUCKET: !Ref AuditLogS3Bucket` and
+  `AUDIT_LOG_S3_PREFIX: !Ref AuditLogS3Prefix` to `ProcessFunction`'s
+  `Environment.Variables`.
+- The `paas-serverless-access-manager` DynamoDB target on the audit table is
+  already declared at `template.yaml:151–154`. Verify (during
+  implementation) that the access manager's `DynamoDB` target grants
+  `DeleteItem` / `BatchWriteItem`; if it only grants read+put, supplement
+  with an explicit policy following the same pattern. Document the
+  conclusion in the MR description.
+
+Use the `sam-template` skill before writing changes to `template.yaml`.
+
+### 6. Tests — `tests/`
+
+- `test_audit_logging.py`: unit tests for `S3AuditLogWriter.write` (gzipped
+  jsonl bytes, key formatting with/without prefix, propagation of S3
+  errors), `DynamoDBAuditLogger.delete_logs` (batch chunking, no-op on
+  empty), and `AuditArchiver.archive` ordering (S3 first, no Dynamo delete
+  if S3 raises) — same `MagicMock` / `StubDynamoDBClient` style already
+  used in this file.
+- `test_dynamodb_audit_logger.py`: extend with a `moto`-backed
+  `delete_logs` integration test (write N entries, delete, verify table
+  empty for that id, other ids untouched).
+- New `test_s3_audit_log_writer.py`: `moto`-backed round-trip test —
+  `S3AuditLogWriter.write` followed by `S3AuditLogReader.get_logs` returns
+  the original list. This is the load-bearing test that the writer and
+  reader stay format-compatible.
+- `test_request_processor.py` (or wherever processor tests live): assert
+  `archiver.archive(id)` is called exactly once after a request is
+  transitioned to `done`, not called for non-terminal exits, not called in
+  dry-run, and that an archival exception does not propagate out of
+  `process_request`.
+
+### 7. Housekeeping
+
+- Tick `TODO.md:60` (`Add audit logging materialising to S3 after successful
+  erasure`).
+- README: short note in the audit logging section that materialisation now
+  happens automatically on `done`.
+
+## Critical files
+
+- `src/dns_de_rte_orchestrator/audit_logging.py` — add writer, archiver,
+  delete method, new factories
+- `src/dns_de_rte_orchestrator/request_processor.py` — inject archiver,
+  trigger at tail of `process_request`
+- `src/dns_de_rte_orchestrator/processor_lambda.py` — construct archiver and
+  pass it in
+- `template.yaml` — env vars + IAM PutObject on Process Lambda
+- `tests/test_audit_logging.py`, `tests/test_dynamodb_audit_logger.py`, new
+  `tests/test_s3_audit_log_writer.py`, processor tests
+- `TODO.md`, `README.md`
+
+## Reuse — do NOT re-implement
+
+- `S3AuditLogReader._key_for` / key format
+  (`audit_logging.py:202–205`) — share with the writer
+- `AuditEntry.to_json` / `from_json` (`audit_logging.py:37–50`) — already
+  symmetric with the JSONL the reader consumes
+- `DynamoDBAuditLogger.get_logs` (`audit_logging.py:144–159`) — used by
+  `archive` to fetch entries before writing
+- `FallbackAuditLogReader` (`audit_logging.py:230–244`) — unchanged,
+  consumes the new S3 objects automatically
+- Test patterns: `moto`'s `mock_aws` fixtures in
+  `tests/test_s3_audit_log_reader.py` and
+  `tests/test_dynamodb_audit_logger.py`; `MagicMock` / `StubDynamoDBClient`
+  in `tests/test_audit_logging.py`
+
+## Verification
+
+1. `uv sync --all-groups`
+2. `uv run pytest` — all tests pass; new tests cover writer round-trip and
+   archiver ordering.
+3. `uv run pyright` (or however basedpyright is invoked here) — no new
+   diagnostics; do not silence with ignores per
+   `[[feedback_pyright_ignores]]`.
+4. `sam validate --lint` and `sam build`.
+5. End-to-end (local moto / integration test): set
+   `AUDIT_LOG_S3_BUCKET`, `AUDIT_LOG_S3_PREFIX`,
+   `DYNAMO_DB_AUDIT_LOGGING_TABLE`; seed an erasure request and audit
+   entries; drive the processor through to `done`; assert (a) the S3
+   object exists at the expected key, (b) the DynamoDB audit rows for that
+   id are gone, (c) `FallbackAuditLogReader.get_logs(id)` still returns
+   the original entries via the S3 fallback.
+
+## Out of scope / follow-ups
+
+- Re-archival of already-`done` requests whose archive previously failed.
+  The current processor only scans non-terminal states, so a partial
+  failure leaves entries in Dynamo with no automatic retry. If this
+  becomes a real problem, add a small periodic sweep that scans `done`
+  requests with surviving audit rows and re-archives. Not needed for
+  initial rollout.
+- Compaction or lifecycle on the S3 bucket — owned by the bucket's
+  managing stack, not this repo.

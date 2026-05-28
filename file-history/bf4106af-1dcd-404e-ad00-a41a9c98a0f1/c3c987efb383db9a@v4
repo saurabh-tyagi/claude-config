@@ -1,0 +1,24 @@
+# Fix B2 — Resolve PR description discrepancy for `need-more-detail`
+
+## Context
+
+The review of DATA-4715 flagged a discrepancy (B2): the PR description said both `done` and `need-more-detail` were treated as no-op cases, but only `case "done": pass` was added. The `need-more-detail` state currently falls through to `case _: raise NotImplementedError`.
+
+The user has clarified: `need-more-detail` is **not** a no-op — it is an unimplemented state that needs future business logic. The `case _` arm is therefore correct and should stay. The fix is to add a TODO item to `TODO.md` tracking that `need-more-detail` processing still needs to be implemented, so the gap is visible alongside the other open implementation items.
+
+## Change
+
+`TODO.md` — add a new unchecked item in the "Implement processing business logic" section:
+
+```
+- [ ] Handle need-more-detail erasure requests
+```
+
+Place it alongside the other phase items (`Handle new`, `Handle phase 1`, etc.).
+
+No code changes. No test changes.
+
+## Verification
+
+1. Confirm `TODO.md` has the new item.
+2. `uv run pytest` — full suite still green (no code changed).

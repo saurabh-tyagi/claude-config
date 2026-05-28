@@ -1,0 +1,112 @@
+import gzip
+import json
+from collections.abc import Generator
+from datetime import datetime, timezone
+from typing import Literal
+
+import boto3
+import pytest
+from moto import mock_aws
+
+from dns_de_rte_orchestrator.audit_logging import S3AuditLogReader
+
+TEST_BUCKET: Literal["test-audit-bucket"] = "test-audit-bucket"
+TEST_PREFIX: Literal["audit-logs"] = "audit-logs"
+
+
+def _make_gzipped_jsonl(entries: list[dict[str, str]]) -> bytes:
+    lines = "\n".join(json.dumps(e) for e in entries)
+    return gzip.compress(lines.encode("utf-8"))
+
+
+@pytest.fixture
+def s3_bucket() -> Generator[None, None, None]:
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="eu-west-1")
+        s3.create_bucket(
+            Bucket=TEST_BUCKET,
+            CreateBucketConfiguration={"LocationConstraint": "eu-west-1"},
+        )
+        yield
+
+
+def build_reader() -> S3AuditLogReader:
+    s3 = boto3.client("s3", region_name="eu-west-1")
+    return S3AuditLogReader(bucket=TEST_BUCKET, prefix=TEST_PREFIX, s3_client=s3)
+
+
+def upload(id: str, entries: list[dict[str, str]]) -> None:
+    s3 = boto3.client("s3", region_name="eu-west-1")
+    key = f"{TEST_PREFIX}/{id}.jsonl.gz"
+    s3.put_object(Bucket=TEST_BUCKET, Key=key, Body=_make_gzipped_jsonl(entries))
+
+
+def test_get_logs_returns_entries_in_file_order(s3_bucket: None):
+    ts1 = "2026-05-07T10:00:00+00:00"
+    ts2 = "2026-05-07T11:00:00+00:00"
+    ts3 = "2026-05-07T12:00:00+00:00"
+    upload(
+        "req-1",
+        [
+            {"id": "req-1", "timestamp": ts1, "message": "first"},
+            {"id": "req-1", "timestamp": ts2, "message": "second"},
+            {"id": "req-1", "timestamp": ts3, "message": "third"},
+        ],
+    )
+    reader = build_reader()
+
+    results = reader.get_logs("req-1")
+
+    assert len(results) == 3
+    assert [e.message for e in results] == ["first", "second", "third"]
+
+
+def test_get_logs_parses_timestamps_correctly(s3_bucket: None):
+    ts_str = "2026-05-07T14:30:45+00:00"
+    upload("req-ts", [{"id": "req-ts", "timestamp": ts_str, "message": "msg"}])
+    reader = build_reader()
+
+    results = reader.get_logs("req-ts")
+
+    expected_ts = datetime(2026, 5, 7, 14, 30, 45, tzinfo=timezone.utc)
+    assert results[0].timestamp == expected_ts
+
+
+def test_get_logs_uses_prefix_in_s3_key(s3_bucket: None):
+    upload(
+        "req-pfx",
+        [{"id": "req-pfx", "timestamp": "2026-01-01T00:00:00+00:00", "message": "m"}],
+    )
+    reader = build_reader()
+
+    results = reader.get_logs("req-pfx")
+
+    assert len(results) == 1
+
+
+def test_get_logs_returns_empty_for_missing_object(s3_bucket: None):
+    reader = build_reader()
+
+    assert reader.get_logs("no-such-id") == []
+
+
+def test_get_logs_returns_empty_for_missing_bucket():
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="eu-west-1")
+        reader = S3AuditLogReader(bucket="does-not-exist", prefix="pfx", s3_client=s3)
+
+        assert reader.get_logs("req-1") == []
+
+
+def test_get_logs_ignores_blank_lines_in_jsonl(s3_bucket: None):
+    lines = '{"id": "req-1", "timestamp": "2026-01-01T00:00:00+00:00", "message": "a"}\n\n{"id": "req-1", "timestamp": "2026-01-01T01:00:00+00:00", "message": "b"}\n'
+    compressed = gzip.compress(lines.encode("utf-8"))
+    boto3.client("s3", region_name="eu-west-1").put_object(
+        Bucket=TEST_BUCKET, Key=f"{TEST_PREFIX}/req-1.jsonl.gz", Body=compressed
+    )
+    reader = build_reader()
+
+    results = reader.get_logs("req-1")
+
+    assert len(results) == 2
+    assert [e.message for e in results] == ["a", "b"]

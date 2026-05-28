@@ -1,0 +1,194 @@
+from datetime import datetime, timedelta, timezone
+from typing import cast
+
+from pytest import MonkeyPatch
+from types_boto3_dynamodb.client import DynamoDBClient
+
+from dns_de_rte_orchestrator.audit_logging import (
+    DYNAMO_DB_AUDIT_LOGGING_TABLE,
+    DynamoDBAuditLogger,
+    InMemoryAuditLogger,
+    NoOpAuditLogger,
+    get_audit_logger,
+    get_dynamodb_audit_logger,
+)
+
+
+class StubDynamoDBClient:
+    def __init__(self) -> None:
+        self.put_item_calls: list[dict[str, object]] = []
+
+    def put_item(self, **kwargs: object) -> dict[str, object]:
+        self.put_item_calls.append(kwargs)
+        return {}
+
+
+def stub_get_dynamodb_audit_logger(
+    table_name: str, expected: DynamoDBAuditLogger
+) -> DynamoDBAuditLogger:
+    assert table_name == "audit-table"
+    return expected
+
+
+def stub_boto3_client(
+    service_name: str, client: StubDynamoDBClient
+) -> StubDynamoDBClient:
+    assert service_name == "dynamodb"
+    return client
+
+
+def test_no_op_log():
+    audit = NoOpAuditLogger()
+    audit.log("id", "message")
+
+
+def test_in_memory_log():
+    before_tests = datetime.now(timezone.utc)
+    audit = InMemoryAuditLogger()
+
+    assert len(audit.memory_log) == 0
+
+    id = "foobar"
+    message = "test message1"
+    timestamp = datetime.now(timezone.utc)
+
+    audit.log(id, message, timestamp)
+    assert len(audit.memory_log) == 1
+    assert audit.memory_log[0] == ((id, timestamp), message)
+
+    message = "message 2"
+    audit.log(id, message)
+    assert len(audit.memory_log) == 2
+    found_entry = audit.memory_log[1]
+    # make sure the timestamp exists and is sensible
+    assert found_entry[0][1] >= before_tests
+    # Assert the entries are what we expect
+    assert found_entry[0][0] == id
+    assert found_entry[1] == message
+
+
+def test_in_memory_log_change_timezone():
+    audit = InMemoryAuditLogger()
+    assert len(audit.memory_log) == 0
+
+    original_tz = timezone(timedelta(hours=12))
+    timestamp = datetime.now(original_tz)
+    id = "baz"
+    message = "testing"
+
+    audit.log(id, message, timestamp)
+    assert len(audit.memory_log) == 1
+
+    # Make sure the timestamp differs
+    assert audit.memory_log[0] != ((id, timestamp), message)
+    utc_timestamp = timestamp.replace(tzinfo=timezone.utc)
+    assert audit.memory_log[0] == ((id, utc_timestamp), message)
+
+
+def test_dynamodb_audit_logger_create_item_serializes_fields():
+    timestamp = datetime(2026, 5, 7, 14, 30, 45, 123000, tzinfo=timezone.utc)
+
+    item = DynamoDBAuditLogger._create_item(  # pyright: ignore[reportPrivateUsage]
+        "req-123", "audit message", timestamp
+    )
+
+    assert item == {
+        "id": {"S": "req-123"},
+        "timestamp": {"N": "1778164245123"},
+        "message": {"S": "audit message"},
+    }
+
+
+def test_dynamodb_audit_logger_log_calls_put_item_with_serialized_item():
+    client = StubDynamoDBClient()
+    logger = DynamoDBAuditLogger(
+        table_name="audit-table",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+    timestamp = datetime(2026, 5, 7, 14, 30, 45, tzinfo=timezone.utc)
+
+    logger.log("req-123", "audit message", timestamp)
+
+    assert client.put_item_calls == [
+        {
+            "TableName": "audit-table",
+            "Item": {
+                "id": {"S": "req-123"},
+                "timestamp": {"N": "1778164245000"},
+                "message": {"S": "audit message"},
+            },
+            "ReturnValues": "NONE",
+        }
+    ]
+
+
+def test_dynamodb_audit_logger_log_relabels_non_utc_timestamp_before_writing():
+    client = StubDynamoDBClient()
+    logger = DynamoDBAuditLogger(
+        table_name="audit-table",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+    original_tz = timezone(timedelta(hours=12))
+    timestamp = datetime(2026, 5, 7, 14, 30, 45, tzinfo=original_tz)
+
+    logger.log("req-123", "audit message", timestamp)
+
+    assert client.put_item_calls == [
+        {
+            "TableName": "audit-table",
+            "Item": DynamoDBAuditLogger._create_item(  # pyright: ignore[reportPrivateUsage]
+                "req-123",
+                "audit message",
+                timestamp.replace(tzinfo=timezone.utc),
+            ),
+            "ReturnValues": "NONE",
+        }
+    ]
+
+
+def test_get_audit_logger_returns_noop_logger_without_env(monkeypatch: MonkeyPatch):
+    monkeypatch.delenv(DYNAMO_DB_AUDIT_LOGGING_TABLE, raising=False)
+
+    logger = get_audit_logger()
+
+    assert isinstance(logger, NoOpAuditLogger)
+
+
+def test_get_audit_logger_returns_dynamodb_logger_when_env_set(
+    monkeypatch: MonkeyPatch,
+):
+    expected = DynamoDBAuditLogger(
+        table_name="audit-table",
+        dynamodb=cast(DynamoDBClient, cast(object, StubDynamoDBClient())),
+    )
+
+    def fake_get_dynamodb_audit_logger(table_name: str) -> DynamoDBAuditLogger:
+        return stub_get_dynamodb_audit_logger(table_name, expected)
+
+    monkeypatch.setenv(DYNAMO_DB_AUDIT_LOGGING_TABLE, "audit-table")
+    monkeypatch.setattr(
+        "dns_de_rte_orchestrator.audit_logging.get_dynamodb_audit_logger",
+        fake_get_dynamodb_audit_logger,
+    )
+
+    logger = get_audit_logger()
+
+    assert logger is expected
+
+
+def test_get_dynamodb_audit_logger_builds_boto3_client(monkeypatch: MonkeyPatch):
+    client = StubDynamoDBClient()
+
+    def fake_boto3_client(service_name: str) -> StubDynamoDBClient:
+        return stub_boto3_client(service_name, client)
+
+    monkeypatch.setattr(
+        "dns_de_rte_orchestrator.audit_logging.boto3.client",
+        fake_boto3_client,
+    )
+
+    logger = get_dynamodb_audit_logger("audit-table")
+
+    assert isinstance(logger, DynamoDBAuditLogger)
+    assert logger.table_name == "audit-table"
+    assert logger.dynamodb is client

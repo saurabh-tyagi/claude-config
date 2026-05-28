@@ -1,0 +1,73 @@
+# Plan: Address MR !62 review comment #1 (retry logic in `delete_logs`)
+
+## Context
+
+LyndonHB left an unresolved comment on `src/dns_de_rte_orchestrator/audit_logging.py:201`:
+
+> "I think this retry stuff would be best isolated a little more into its own code.
+> I am also unsure at a glance what the `time.sleep` call does. Why are we doing a left bitwise shift?"
+
+The current code in `DynamoDBAuditLogger.delete_logs` (lines 187–205) inlines three concerns into a single `for` loop:
+1. chunking the key list into 25-item slices,
+2. issuing `batch_write_item` and threading `UnprocessedItems` back into the next call,
+3. exponential backoff via `time.sleep(min(0.1 * (1 << int(attempt)), 2))` and raising after `DYNAMO_BATCH_WRITE_MAX_ATTEMPTS`.
+
+The `1 << attempt` is exponential backoff (1, 2, 4, 8, 16) but the bitshift is the source of the reviewer's confusion. The retry/backoff bookkeeping is also entangled with the chunking loop, making both harder to read and to test in isolation.
+
+The intended outcome is: keep behaviour and the public API identical, satisfy the reviewer's two asks (isolate the retry, make the sleep self-explanatory), and preserve the existing tests in `tests/test_audit_logging.py` that monkeypatch `dns_de_rte_orchestrator.audit_logging.time.sleep`.
+
+## Approach
+
+Extract the retry/backoff logic into a private helper on `DynamoDBAuditLogger` and replace the bitshift with a named, documented backoff helper. No behaviour change.
+
+### Changes in `src/dns_de_rte_orchestrator/audit_logging.py`
+
+1. **Add a module-level helper** `_backoff_seconds(attempt: int) -> float`:
+   - Returns `min(BACKOFF_BASE_SECONDS * (2 ** attempt), BACKOFF_MAX_SECONDS)`.
+   - One-line docstring naming this as capped exponential backoff.
+   - Introduce two `Final` constants alongside the existing `DYNAMO_BATCH_WRITE_MAX_*`:
+     - `BACKOFF_BASE_SECONDS: Final[float] = 0.1`
+     - `BACKOFF_MAX_SECONDS: Final[float] = 2.0`
+   - This replaces the inline `min(0.1 * (1 << int(attempt)), 2)` and removes the bitshift the reviewer flagged. `2 ** attempt` is the conventional, self-documenting form.
+
+2. **Extract the retry loop** into a new private method
+   `_batch_write_with_retry(self, request_items: dict[str, list[WriteRequestTypeDef]]) -> None`:
+   - Owns the `for attempt in range(DYNAMO_BATCH_WRITE_MAX_ATTEMPTS)` loop, the `cast` of `UnprocessedItems`, the `time.sleep(_backoff_seconds(attempt))` call, and the `for/else` that raises `RuntimeError`.
+   - Same `RuntimeError` message as today so the existing test
+     `test_delete_logs_raises_after_max_attempts` (matches `"unprocessed deletes"`) keeps passing.
+   - Crucially: still calls `time.sleep` from this module, so existing monkeypatches of
+     `dns_de_rte_orchestrator.audit_logging.time.sleep` (used in
+     `test_delete_logs_retries_unprocessed_items` and
+     `test_delete_logs_raises_after_max_attempts`) continue to work unmodified.
+
+3. **Slim `delete_logs`** to two responsibilities:
+   - Build the keys list via the paginated query (unchanged).
+   - For each chunk of `DYNAMO_BATCH_WRITE_MAX_ITEMS`, build `request_items` and delegate to
+     `self._batch_write_with_retry(request_items)`.
+
+### Files modified
+
+- `src/dns_de_rte_orchestrator/audit_logging.py` — sole code change.
+
+### Files explicitly NOT modified
+
+- `tests/test_audit_logging.py` — tests assert observable behaviour
+  (number of `batch_write_item` calls, number of `sleep_calls`, the `RuntimeError` message)
+  and patch `audit_logging.time.sleep`. All still hold after the refactor.
+- `tests/test_dynamodb_audit_logger.py` — moto-backed integration tests, behaviour-only.
+
+## Verification
+
+1. `uv run pytest tests/test_audit_logging.py tests/test_dynamodb_audit_logger.py -q`
+   — both `delete_logs` retry tests and the chunking test must still pass without edits.
+2. `uv run pytest -q` — full suite green.
+3. `uv run basedpyright src/dns_de_rte_orchestrator/audit_logging.py` — no new diagnostics
+   (the existing `cast` to `dict[str, list[WriteRequestTypeDef]]` moves into the helper unchanged).
+4. Optional sanity: re-read the diff and confirm the body of `delete_logs` is now ~10 lines
+   focused on chunking, with the retry concern fully owned by `_batch_write_with_retry`.
+
+## Out of scope
+
+The other 5 unresolved review comments (request_processor empty-case, archiver-in-`done`-branch,
+`get_logs` sort-by-timestamp, typed `DuplicateRequestError`, README reorder) are tracked
+separately and not addressed by this plan.

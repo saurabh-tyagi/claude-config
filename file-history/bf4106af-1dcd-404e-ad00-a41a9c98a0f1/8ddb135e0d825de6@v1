@@ -1,0 +1,192 @@
+import json
+import os
+from datetime import datetime, timezone
+from typing import cast
+from unittest.mock import MagicMock
+
+from dns_de_rte_orchestrator.dryrun import DRY_RUN_MODE_ENV_VAR
+from dns_de_rte_orchestrator.request_repository import REPOSITORY_TYPE_ENV_VAR
+
+# Must be set before `creator_lambda` is imported — that module calls
+# get_request_repository() at import time, so a fixture would run too late.
+_ = os.environ.setdefault(REPOSITORY_TYPE_ENV_VAR, "memory")
+_ = os.environ.setdefault(DRY_RUN_MODE_ENV_VAR, "false")
+
+import pytest  # noqa: E402
+
+import dns_de_rte_orchestrator.creator_lambda as creator_module  # noqa: E402
+from dns_de_rte_orchestrator.creator_lambda import (  # noqa: E402
+    InvalidRequestError,
+    lambda_handler,
+    request_from_event,
+)
+
+
+def make_body(
+    id: str = "req-123",
+    source: str = "onetrust",
+    state: str = "new",
+    date_issued: str = "2023-01-01T12:00:00+00:00",
+    erasure_details: dict[str, str] | None = None,
+    site_ids: list[int] | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "id": id,
+            "source": source,
+            "state": state,
+            "date_issued": date_issued,
+            "erasure_details": erasure_details or {"email": "user@example.com"},
+            "site_ids": site_ids,
+        }
+    )
+
+
+def make_proxy_event(body: str, base64_encoded: bool = False) -> dict[str, object]:
+    return {"body": body, "isBase64Encoded": base64_encoded}
+
+
+def test_request_from_event_happy_path():
+    event = make_proxy_event(make_body())
+    request = request_from_event(event)
+    assert request.id == "req-123"
+    assert request.source == "onetrust"
+    assert request.state == "new"
+    assert request.date_issued == datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    assert request.erasure_details == {"email": "user@example.com"}
+
+
+def test_request_from_event_missing_field_raises():
+    body = json.dumps(
+        {
+            "source": "onetrust",
+            "state": "new",
+            "date_issued": "2023-01-01T12:00:00+00:00",
+            "erasure_details": {},
+        }
+    )
+    with pytest.raises(InvalidRequestError, match="Missing required fields"):
+        _ = request_from_event(make_proxy_event(body))
+
+
+def test_request_from_event_invalid_json_raises():
+    with pytest.raises(InvalidRequestError, match="Invalid JSON body"):
+        _ = request_from_event(make_proxy_event("not-json"))
+
+
+def test_request_from_event_non_new_state_raises():
+    body = make_body(state="done")
+    with pytest.raises(InvalidRequestError, match="must be created in state 'new'"):
+        _ = request_from_event(make_proxy_event(body))
+
+
+def test_request_from_event_defaults_state_to_new_when_omitted():
+    body = json.dumps(
+        {
+            "id": "req-123",
+            "source": "onetrust",
+            "date_issued": "2023-01-01T12:00:00+00:00",
+            "erasure_details": {"email": "user@example.com"},
+        }
+    )
+    result = request_from_event(make_proxy_event(body))
+    assert result.state == "new"
+
+
+def test_request_from_event_non_string_id_raises():
+    body = json.dumps(
+        {
+            "id": 12345,
+            "source": "onetrust",
+            "date_issued": "2023-01-01T12:00:00+00:00",
+            "erasure_details": {"email": "user@example.com"},
+        }
+    )
+    with pytest.raises(
+        InvalidRequestError, match="Field 'id' must be a non-empty string"
+    ):
+        _ = request_from_event(make_proxy_event(body))
+
+
+def test_request_from_event_non_string_source_raises():
+    body = json.dumps(
+        {
+            "id": "req-123",
+            "source": None,
+            "date_issued": "2023-01-01T12:00:00+00:00",
+            "erasure_details": {"email": "user@example.com"},
+        }
+    )
+    with pytest.raises(
+        InvalidRequestError, match="Field 'source' must be a non-empty string"
+    ):
+        _ = request_from_event(make_proxy_event(body))
+
+
+def test_request_from_event_unknown_detail_key_raises():
+    body = make_body(
+        erasure_details={"email": "user@example.com", "unknown-field": "x"}
+    )
+    with pytest.raises(InvalidRequestError, match="Unknown erasure_details key"):
+        _ = request_from_event(make_proxy_event(body))
+
+
+def test_request_from_event_non_string_detail_value_raises():
+    body = json.dumps(
+        {
+            "id": "req-123",
+            "source": "onetrust",
+            "date_issued": "2023-01-01T12:00:00+00:00",
+            "erasure_details": {"email": ["a@b.com", "c@d.com"]},
+        }
+    )
+    with pytest.raises(InvalidRequestError, match="must be a non-empty string"):
+        _ = request_from_event(make_proxy_event(body))
+
+
+def test_request_from_event_site_ids_rejects_boolean():
+    body = json.dumps(
+        {
+            "id": "req-123",
+            "source": "onetrust",
+            "date_issued": "2023-01-01T12:00:00+00:00",
+            "erasure_details": {"email": "user@example.com"},
+            "site_ids": [True],
+        }
+    )
+    with pytest.raises(InvalidRequestError, match="site_ids entries must be integers"):
+        _ = request_from_event(make_proxy_event(body))
+
+
+def test_request_from_event_invalid_date_raises():
+    body = make_body(date_issued="not-a-date")
+    with pytest.raises(InvalidRequestError, match="Invalid date_issued"):
+        _ = request_from_event(make_proxy_event(body))
+
+
+def test_lambda_handler_returns_200_on_success(monkeypatch: pytest.MonkeyPatch):
+    mock_repo = MagicMock()
+    monkeypatch.setattr(creator_module, "request_repo", mock_repo)
+    event = make_proxy_event(make_body())
+    response = cast(dict[str, object], lambda_handler(event, MagicMock()))
+    assert response["statusCode"] == 200
+    assert json.loads(str(response["body"])) == {"id": "req-123"}
+    cast(MagicMock, mock_repo.create).assert_called_once()
+
+
+def test_lambda_handler_returns_400_on_bad_body(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(creator_module, "request_repo", MagicMock())
+    event = make_proxy_event("not-json")
+    response = cast(dict[str, object], lambda_handler(event, MagicMock()))
+    assert response["statusCode"] == 400
+    assert json.loads(str(response["body"])) == {"error": "invalid request body"}
+
+
+def test_lambda_handler_returns_500_on_repo_error(monkeypatch: pytest.MonkeyPatch):
+    mock_repo = MagicMock()
+    cast(MagicMock, mock_repo.create).side_effect = RuntimeError("DB down")
+    monkeypatch.setattr(creator_module, "request_repo", mock_repo)
+    event = make_proxy_event(make_body())
+    response = cast(dict[str, object], lambda_handler(event, MagicMock()))
+    assert response["statusCode"] == 500
+    assert json.loads(str(response["body"])) == {"error": "internal error"}

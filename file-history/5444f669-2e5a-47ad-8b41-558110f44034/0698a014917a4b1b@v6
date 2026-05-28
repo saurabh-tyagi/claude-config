@@ -1,0 +1,114 @@
+# Plan: Address MR !62 review comment #5 — typed `DuplicateRequestError` from `RequestRepository`
+
+## Context
+
+LyndonHB left an unresolved comment on `src/dns_de_rte_orchestrator/creator_lambda.py:157`:
+
+> "We should take a note and make `request_repo` throw a more sensible exception so it is easier to know what has happened (i.e. a duplicate key was raised)"
+
+Today the `creator_lambda` discriminates duplicate-id failures by sniffing the AWS `ClientError`'s error code:
+
+```python
+except ClientError as e:
+    if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+        return _response(409, ...)
+```
+
+This leaks DynamoDB-specific knowledge into the lambda. The two issues:
+
+1. **Layer leak** — `creator_lambda` is the HTTP boundary; it shouldn't know what storage backend the repo uses or what error code AWS returns. If a future implementer swaps the backend (or adds an in-memory mode for local dev), the duplicate path stops returning 409 — the in-memory repo today raises a plain `ValueError` (`request_repository.py:91`) which today matches *no* branch and falls into the generic 500.
+2. **Asymmetry between repo implementations** — `InMemoryRequestRepository.create` raises `ValueError(f"{request.id} already exists")` while `DynamoDBRequestRepository.create` raises `botocore.exceptions.ClientError`. There is no shared exception type the lambda can catch.
+
+The intended outcome: introduce a domain-level `DuplicateRequestError` in `request_repository.py`, raise it from both `InMemoryRequestRepository.create` and `DynamoDBRequestRepository.create` when a duplicate id is detected, and have `creator_lambda` catch it directly to return 409. The boundary lambda no longer touches DynamoDB error codes; both repos behave symmetrically.
+
+## Approach
+
+### Changes in `src/dns_de_rte_orchestrator/request_repository.py`
+
+1. Add a new exception class at the module level (near the `RequestRepository` ABC, before `InMemoryRequestRepository`):
+   ```python
+   class DuplicateRequestError(Exception):
+       """Raised by RequestRepository.create when a request with the same id already exists."""
+
+       def __init__(self, id: str) -> None:
+           self.id: str = id
+           super().__init__(f"Erasure request with id '{id}' already exists")
+   ```
+   Plain `Exception` subclass (not `ValueError`) so callers can catch it without losing the existing `ValueError` semantics elsewhere.
+
+2. Update `InMemoryRequestRepository.create` (`request_repository.py:89–92`) to raise the new error:
+   ```python
+   if request.id in self._db:
+       raise DuplicateRequestError(request.id)
+   ```
+
+3. Update `DynamoDBRequestRepository.create` (`request_repository.py:144–153`) to translate the boto `ConditionalCheckFailedException` into the new error. The cleanest place is inside `create` itself — wrap the `put_item` call:
+   ```python
+   try:
+       _response = self.dynamodb.put_item(
+           TableName=self.table_name,
+           Item=item,
+           ReturnValues="NONE",
+           ConditionExpression=self.NOT_EXISTS_CONDITION,
+       )
+   except ClientError as e:
+       if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+           raise DuplicateRequestError(request.id) from e
+       raise
+   ```
+   Add the `from botocore.exceptions import ClientError` import at the top if not already present (it isn't today — `creator_lambda` imports it directly).
+
+4. Leave `update`'s `ValueError` ("does not already exists") alone — that path is not part of this comment and only used by the in-memory repo.
+
+### Changes in `src/dns_de_rte_orchestrator/creator_lambda.py`
+
+5. Replace the `ClientError` sniff (lines 150–163) with a `DuplicateRequestError` catch. The boundary now reads cleanly without knowing about DynamoDB:
+   ```python
+   try:
+       if in_dry_run_mode:
+           logger.warning("DryRun: Would have created request for %s", request.id)
+       else:
+           request_repo.create(request)
+   except DuplicateRequestError:
+       logger.warning("Duplicate erasure request rejected: %s", request.id)
+       return _response(409, {"error": "conflict", "id": request.id})
+   except Exception:
+       logger.exception("Failed to create erasure request %s", str(request))
+       return _response(500, {"error": "internal error"})
+   ```
+   Drop the now-unused `from botocore.exceptions import ClientError` import.
+
+   Add the new import: `from dns_de_rte_orchestrator.request_repository import DuplicateRequestError` (alongside the existing `RequestRepository, get_request_repository` import on line 20 — extend that one).
+
+### Test updates
+
+6. **`tests/test_request_repository.py`** — the existing test at line 100 asserts `ValueError, match="req-123 already exists"` from the in-memory repo. Update it to `DuplicateRequestError` and assert the `id` attribute is set. Add a parallel test for `DynamoDBRequestRepository.create` translating `ConditionalCheckFailedException` into `DuplicateRequestError` (using a `MagicMock` dynamodb client whose `put_item` raises `ClientError`).
+
+7. **`tests/test_creator_lambda.py`** — the test at line 197 (`test_lambda_handler_returns_409_on_duplicate_id`) currently makes the mock repo raise a `ClientError`. Change it to raise `DuplicateRequestError("req-123")` instead. The 500-on-other-`ClientError` test (line 209) is no longer load-bearing for the duplicate path but is still valid (a generic ClientError now falls into the bare `except Exception` and returns 500) — verify the assertion still holds; if so, leave it alone.
+
+### Files modified
+
+- `src/dns_de_rte_orchestrator/request_repository.py` — new `DuplicateRequestError`, raise it from both `create` implementations.
+- `src/dns_de_rte_orchestrator/creator_lambda.py` — catch `DuplicateRequestError` instead of sniffing `ClientError`.
+- `tests/test_request_repository.py` — update the in-memory duplicate test, add a Dynamo duplicate test.
+- `tests/test_creator_lambda.py` — update the 409 test to use `DuplicateRequestError`.
+
+### Files NOT modified
+
+- `RequestRepository.update`'s `ValueError` — not part of this comment.
+- Any other call site of `request_repo.create` — `creator_lambda` is the only caller.
+
+### Open TODO (`TODO.md`)
+
+The reviewer's comment was prefaced "we should take a note and …", implying this was tracked as future work. The branch's `TODO.md` already has a `need-more-detail` open item — once this is implemented and merged, no TODO entry is needed. (No new TODO line should be added.)
+
+## Verification
+
+1. `uv run pytest tests/test_request_repository.py tests/test_creator_lambda.py -q` — both updated tests plus the new Dynamo translation test pass.
+2. `uv run pytest -q` — full suite green.
+3. `uv run basedpyright src/dns_de_rte_orchestrator/request_repository.py src/dns_de_rte_orchestrator/creator_lambda.py` — no new diagnostics.
+4. Visual sanity: `creator_lambda` no longer imports `botocore.exceptions.ClientError`; both repo implementations raise the same `DuplicateRequestError` for the duplicate-id case.
+
+## Out of scope
+
+The remaining 1 unresolved review comment (#6, README reorder) is tracked separately. Comments #1–#4 are already implemented and committed.

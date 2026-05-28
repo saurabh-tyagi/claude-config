@@ -1,0 +1,466 @@
+import logging
+from abc import ABC
+from datetime import datetime
+from typing import Final
+
+from dns_de_rte_orchestrator.as400 import AS400Notifier
+from dns_de_rte_orchestrator.audit_logging import AuditArchiver, AuditLogger
+from dns_de_rte_orchestrator.customer_api_client import (
+    ALL_SITE_IDS,
+    CustomerAPIClient,
+    CustomerDetails,
+)
+from dns_de_rte_orchestrator.erasure_request import (
+    VALID_STATES,
+    ErasureRequest,
+    ErasureState,
+)
+from dns_de_rte_orchestrator.request_repository import RequestRepository
+
+logger = logging.getLogger(__name__)
+
+
+class RequestProcessor:
+    """Container for Erasure Request processing logic"""
+
+    PROCESS_STATES: tuple[ErasureState, ...] = (
+        "new",
+        "in-progress",
+        "phase-1",
+        "phase-2",
+        "phase-3",
+    )
+    """The list of states (in order) that will have items processed"""
+
+    def __init__(
+        self,
+        repository: RequestRepository,
+        audit: AuditLogger,
+        as400: AS400Notifier,
+        customer_api: CustomerAPIClient,
+        dry_run: bool = False,
+        archiver: AuditArchiver | None = None,
+    ) -> None:
+        self.repo: RequestRepository = repository
+        self.audit: AuditLogger = audit
+        self.as400: AS400Notifier = as400
+        self.dry_run: Final[bool] = dry_run
+        self.customer_api: CustomerAPIClient = customer_api
+        self.archiver: AuditArchiver | None = archiver
+        if dry_run:
+            logger.warning("Request Processor is in dry-run mode")
+
+    def _check_timeout(self, timeout: datetime | None = None) -> bool:
+        if timeout is None:
+            return False
+        now: datetime = datetime.now()
+        return now >= timeout
+
+    def process(self, timeout: datetime | None = None):
+        """
+        Process the requests with an optional timeout to bail early before.
+
+        When working in a time limited environment like AWS Lambda, this
+        timeout should be set a little before the whole Lambda will expire to
+        account for interrupting the running logic.
+
+        The only time an error should be raised related to the timeout is if we
+        timeout before the process has even begun as this indicates too short a
+        timeout.
+        """
+
+        if timeout is not None:
+            logger.info("Process triggered with timeout of %s", timeout.isoformat())
+        else:
+            logger.info("Process triggered without timeout")
+
+        # This should do the following:
+        # - Get all requests in a non-terminal state
+        # - process each request appropriatelty
+        # It should do this for each different non-terminal state in turn and
+        # be checking for time remaining in-between each to make sure that we
+        # have enough time left for this invocation, since this could be running
+        # in an AWS Lambda.
+        # We can also happily continue at the next function call since we will
+        # be running often
+
+        if self._check_timeout(timeout):
+            # Timed out before we began
+            # This isn't right so raise an error
+            raise ValueError("We timed out before we began")
+
+        # NOTE: We could improve the timeout logic by timning each previous
+        # process. We'd then use this data to estimate if we'd timeout rather
+        # than using a safety margin
+
+        # Collect some stats on the process
+        failed_request_count: int = 0
+        successful_request_count: int = 0
+        processed_request_count: int = 0
+        timed_out: bool = False
+
+        # NOTE: When we get all those requests in a given state, we may
+        # well end up processing the same request through multiple states
+        # if it has been transitioned to the next AND the storage layer has
+        # consistently updated.
+        for state in self.PROCESS_STATES:
+            # Stop early if we've timed out
+            # We can process this state in another iteration
+            if self._check_timeout(timeout):
+                logger.info('Timed out before checking state "%s"', state)
+                timed_out = True
+                break
+
+            all_in_state = self.repo.get_all_in_state(state)
+            logger.info('Found %d entries for state "%s"', len(all_in_state), state)
+
+            for request in all_in_state:
+                # Stop processing the items if we've timed out
+                # We can pick back up in the next iteration
+                if self._check_timeout(timeout):
+                    logger.info(
+                        'Timed out while checking state "%s" before request: %s',
+                        state,
+                        request,
+                    )
+                    timed_out = True
+                    break
+                # Process the single erasure request
+                # We aren't using batch operations here so that we can be
+                # idempotent as it relates to each individual request
+                processed_request_count += 1
+                try:
+                    # We do this in a try block as we don't want the whole
+                    # process to fail if individual requests do
+                    self.process_request(request)
+                except ErasureRequestException:
+                    logger.exception("Problem processing request %s", request.id)
+                    failed_request_count += 1
+                    continue
+                successful_request_count += 1
+                self._archive_if_done(request)
+
+        # After all the processing has been completed we need to quickly do
+        # alerts as we may have timed out
+        if processed_request_count > 0:
+            logger.info(
+                "Processed %d/%d requests successfully",
+                successful_request_count,
+                processed_request_count,
+            )
+            if failed_request_count >= processed_request_count:
+                # Raise an exception if all processing failed.
+                # This could be due to some misconfiguration so the calling
+                # code should be alerted
+                raise AllProcessingFailed(failed_request_count)
+            if timed_out:
+                # This logging message is partly redundent but if we often
+                # time out it might be a bad sign
+                logger.warning("Timed out while processing")
+            if failed_request_count > 0:
+                logger.error("%d requests failed to process", failed_request_count)
+        else:
+            logger.info("No requests processed")
+            if timed_out:
+                logger.warning("We timed out while checking states without finding any")
+
+    def process_request(self, request: ErasureRequest) -> None:
+        """Process a single request"""
+        # This is where the meat of the business logic should be
+        logger.info("Processing request: %s", request)
+        self.audit.log(request.id, "Request was selected for processing")
+
+        # Defensively align the state to a standard lower case format
+        request_state: str = request.state.strip().lower()
+        if request_state not in VALID_STATES:
+            raise InvalidRequestState(request)
+
+        cast_request_state: ErasureState = request_state
+        match cast_request_state:
+            case "new":
+                self.process_new(request)
+            case "in-progress":
+                self.process_in_progress(request)
+            case "phase-1":
+                self.process_phase1(request)
+            case "phase-2":
+                self.process_phase2(request)
+            case "phase-3":
+                self.process_phase3(request)
+            case _:
+                raise NotImplementedError(
+                    f'Request processing of state "{request_state}" not implemented'
+                )
+
+    def _archive_if_done(self, request: ErasureRequest) -> None:
+        """Archive the audit log to S3 if the request has reached a terminal "done" state.
+
+        Runs after a successful ``process_request`` only. Archive failures are
+        swallowed and logged so they do not fail the surrounding ``process``
+        sweep — the next invocation will retry from DynamoDB.
+        """
+        if self.dry_run or self.archiver is None:
+            return
+        if request.state != "done":
+            return
+        try:
+            self.archiver.archive(request.id)
+        except Exception:
+            logger.exception(
+                "Failed to archive audit log for request %s; will be retried on next invocation",
+                request.id,
+            )
+
+    @classmethod
+    def _validate_request(
+        cls, current_state: ErasureState, request: ErasureRequest
+    ) -> None:
+        """
+        Validate a request for the given current state.
+
+        This will raise an exception if the request is not valid.
+        """
+        if request.state != current_state:
+            raise WrongStateForProcess(request, current_state)
+
+    def _transition_request(
+        self,
+        request: ErasureRequest,
+        new_state: ErasureState,
+        reason: str | None = None,
+    ) -> None:
+        """
+        Helper function to transition a request to a new state.
+
+        You can provide an optional reason that will be used in audit logging.
+        """
+        logger.info("Transitioning request %s to %s", request.id, new_state)
+        request.state = new_state
+        if self.dry_run:
+            logger.info("DryRun: Would update repository")
+        else:
+            self.repo.update(request)
+        message = f"Request was transitioned to {new_state}"
+        if reason:
+            message = message + " due to: " + reason
+        if not self.dry_run:
+            self.audit.log(request.id, message)
+
+    def process_new(self, request: ErasureRequest) -> None:
+        self._validate_request("new", request)
+        logger.info("Processing new request %s", request.id)
+
+        # Check if there is an email attached to the request
+        email: str | None = request.erasure_details.get("email")
+
+        if email is None or email.strip() == "":
+            # Missing email address, this should always be present as the data
+            # privacy team verify this in OneTrust before the request reaches
+            # our system
+
+            logger.warning(
+                "Request %s has no email so will be transitioned to need-more-detail",
+                request.id,
+            )
+            # Update the request before raising an exception
+            self._transition_request(request, "need-more-detail", "no email address")
+            raise MissingEmailAddress(request)  # TODO: Should we raise?
+
+        # TODO: Update OneTrust in some way to tell it that we've started to
+        # process a given request
+
+        self._transition_request(request, "in-progress")
+
+    def process_in_progress(self, request: ErasureRequest) -> None:
+        self._validate_request("in-progress", request)
+
+        # TODO: In the original process this "in-progress" stage did not do a
+        # great deal
+
+        # Enrich the request if possible or required
+        self.enrich_request(request)
+
+        # TODO: Update OneTrust in some way to tell it that we've moved to the
+        # next phase
+
+        # Move to the next state
+        self._transition_request(request, "phase-1")
+
+    def process_phase1(self, request: ErasureRequest) -> None:
+        self._validate_request("phase-1", request)
+        logger.info("Running request %s through Phase-1", request.id)
+        # This is the legacy system stage
+        # For now all this should do is notify the AS400 team via both Slack
+        # AND Microsoft Teams
+        self.notify_as400_team(request)
+
+        # TODO: Update OneTrust that phase-1 was done
+
+        self._transition_request(request, "phase-2")
+
+    def process_phase2(self, request: ErasureRequest) -> None:
+        # This is where the core of erasure logic happened in Tines
+        self._validate_request("phase-2", request)
+
+        # TODO: Update OneTrust throughout each part of phase-2
+
+        # TODO: Subflow 1 from Tines:
+        # TODO: Search for the customer in All Sites using the Customer API
+        # TODO: Submit an erasure to the Customer Erasures API
+        # If we found the sites for a customer we include those, otherwise it
+        # is not included
+
+        # TODO: Subflow 2 from Tines:
+        # TODO: Check the Customer Erasures API Status for the Erasure Request
+        # If it's successful we then transition to the next subflow
+
+        # TODO: Subflow 3 from Tines:
+        # TODO: Search and Delete Zendesk Tickets
+
+        # TODO: Subflow 4 from Tines:
+        # TODO: Search and delete Zendesk users
+
+        # TODO: Subflow 5 from Tines:
+        # TODO: Purge the deleted Zendesk tickets
+
+        # TODO: Subflow 6 from Tines:
+        # TODO: Purge the deleted Zendesk users
+
+        # Finally after all this we transition to the next stage
+
+        raise NotImplementedError("phase-2 Request processing not implemented")
+
+    def process_phase3(self, request: ErasureRequest) -> None:
+        self._validate_request("phase-3", request)
+        # TODO: Phase-3 from Tines
+        # This is just checking if the customer still appears in the customer
+        # API or not
+        # TODO: What should we do if the previous erasure states all failed?
+
+        # Finally transition to done
+        raise NotImplementedError("phase-3 Request processing not implemented")
+
+    def enrich_request(self, request: ErasureRequest) -> None:
+        """Enrich the erasure request if needed with details from other sources"""
+        # Enrichment could include getting more details on the customer that
+        # will be needed by downstream erasure processes
+
+        if "email" not in request.erasure_details:
+            raise MissingEmailAddress(request)
+
+        # We will try and find details from all customer regions
+        enrichment_data: list[CustomerDetails] = []
+        enrichment_data.extend(
+            self.customer_api.get_customer_details(
+                email=request.erasure_details["email"]
+            )
+        )
+        for site_id in ALL_SITE_IDS:
+            enrichment_data.extend(
+                self.customer_api.get_customer_details(
+                    email=request.erasure_details["email"], site_id=site_id
+                )
+            )
+
+        found_site_ids: set[int] = set()
+        fields_added: list[str] = []
+        for entry in enrichment_data:
+            # Enrich with the first found entries
+            # If the customer has used the email in multiple regions with
+            # different details this might enrich with weird values.
+            # Essentially this is a best effort enrichment as email should be
+            # enough for most systems to erase by, the extra details are just
+            # useful for debugging purposes.
+            if entry.first_name and "first-name" not in request.erasure_details:
+                request.erasure_details["first-name"] = entry.first_name
+                fields_added.append("first-name")
+            if entry.last_name and "last-name" not in request.erasure_details:
+                request.erasure_details["last-name"] = entry.last_name
+                fields_added.append("last-name")
+            if entry.loyalty_number and "rfl" not in request.erasure_details:
+                request.erasure_details["rfl"] = entry.loyalty_number
+                fields_added.append("rfl")
+            if entry.mobile_number and "phone-number" not in request.erasure_details:
+                request.erasure_details["phone-number"] = entry.mobile_number
+                fields_added.append("phone-number")
+            if entry.site_id:
+                found_site_ids.add(entry.site_id)
+
+        audit_message: str | None = None
+        if len(fields_added) > 0:
+            fields_list = ",".join(fields_added)
+            audit_message = (
+                f"The following fields were added via enrichment: {fields_list}"
+            )
+        # Update site_ids
+        current_site_ids = set(request.site_ids)
+        if current_site_ids != found_site_ids:
+            new_site_ids: list[int] = list(found_site_ids | current_site_ids)
+            new_site_ids.sort()
+            if new_site_ids != request.site_ids:
+                request.site_ids = new_site_ids
+                new_sites_list: str = ",".join(map(str, new_site_ids))
+                sites_updated_msg = f"site_ids were updated to: {new_sites_list}"
+                if audit_message is None:
+                    audit_message = sites_updated_msg
+                else:
+                    audit_message += f"\n{sites_updated_msg}"
+
+        # Update audit log with details on enrichment
+        if audit_message is not None:
+            self.audit.log(request.id, audit_message)
+
+    def notify_as400_team(self, request: ErasureRequest) -> None:
+        logger.info("Notifying AS400 of request %s", request.id)
+        self.as400.notify(request)
+
+    def send_status_update(self, request: ErasureRequest, update: str) -> None:
+        """Send a status update to OneTrust"""
+        logger.info("Sending update to OneTrust for %s: %s", request.id, update)
+        raise NotImplementedError("Sending status update to OneTrust not implemented")
+
+
+class AllProcessingFailed(Exception):
+
+    def __init__(self, count: int) -> None:
+        self.count: int = count
+        super().__init__(f"Processing all {count} requests failed")
+
+
+class ErasureRequestException(Exception, ABC):
+    """Parent exception for Erasure Request process"""
+
+    def __init__(self, request: ErasureRequest, message: str) -> None:
+        self.request: ErasureRequest = request
+        super().__init__(message)
+
+
+class InvalidRequestState(ErasureRequestException):
+    """Exception raised when a request is not in a valid state"""
+
+    def __init__(self, request: ErasureRequest) -> None:
+        self.state: str = request.state
+        super().__init__(
+            request=request,
+            message=f"Request {request.id} is in an invalid state: {self.state}",
+        )
+
+
+class WrongStateForProcess(ErasureRequestException):
+    """Exception raised when a request is in the wrong state for the given process."""
+
+    def __init__(self, request: ErasureRequest, expected: ErasureState) -> None:
+        self.state: str = request.state
+        super().__init__(
+            request=request,
+            message=f"Invalid state on request {request.id} for process: {self.state} != {expected}",
+        )
+
+
+class MissingEmailAddress(ErasureRequestException):
+    """Exception raised if the request is missing an email address"""
+
+    def __init__(self, request: ErasureRequest) -> None:
+        super().__init__(
+            request=request, message=f"Missing email address on request {request.id}"
+        )

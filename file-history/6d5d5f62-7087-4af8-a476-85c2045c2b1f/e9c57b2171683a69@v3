@@ -1,0 +1,59 @@
+version = 0.1
+
+[default.build.parameters]
+beta_features = true
+
+[default.sync.parameters]
+beta_features = true
+
+[dev.deploy.parameters]
+region = "eu-west-1"
+role_arn = "arn:aws:iam::334512769709:role/CFDeploy"
+s3_bucket = "hbi-dns-infra-datalake"
+s3_prefix = "data/rte-orchestrator/dev"
+tags = [
+    "application=rte-orchestrator",
+    "name=rte-orchestrator",
+    "vertical=data",
+    "owner=data",
+    "team=de",
+    "managed_by=aws-sam",
+    "product=right-to-erasure",
+    "project=right-to-erasure",
+    "repository=https://gitlab.com/hnbi/dns/dns-de-rte-orchestrator"
+]
+capabilities = "CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
+stack_name = "data-rte-orchestrator-dev"
+parameter_overrides = """
+  Environment=dev
+  DynamoDBTable=rte-orchestrator-dev
+  DynamoDBTableGSI=idx-by-state-dev
+  AuditLogDynamoDBTable=rte-orchestrator-audit-dev
+  VPCEndpointId={{resolve:ssm:/dns/de/rte-orchestrator/prod/vpce-id}}
+"""
+
+[prod.deploy.parameters]
+region = "eu-west-1"
+role_arn = "arn:aws:iam::334512769709:role/CFDeploy"
+s3_bucket = "hbi-dns-infra-datalake"
+s3_prefix = "data/rte-orchestrator/prod"
+tags = [
+    "application=rte-orchestrator",
+    "name=rte-orchestrator",
+    "vertical=data",
+    "owner=data",
+    "team=de",
+    "managed_by=aws-sam",
+    "product=right-to-erasure",
+    "project=right-to-erasure",
+    "repository=https://gitlab.com/hnbi/dns/dns-de-rte-orchestrator"
+]
+capabilities = "CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
+stack_name = "data-rte-orchestrator-prod"
+parameter_overrides = """
+  Environment=prod
+  DynamoDBTable=rte-orchestrator-prod
+  DynamoDBTableGSI=idx-by-state-prod
+  AuditLogDynamoDBTable=rte-orchestrator-audit-prod
+  VPCEndpointId={{resolve:ssm:/dns/de/rte-orchestrator/prod/vpce-id}}
+"""

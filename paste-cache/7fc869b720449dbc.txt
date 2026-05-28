@@ -1,0 +1,7 @@
+ check @agents/deep-code-reviewer.md  and add focus on the following topics -                                                                                                                                      
+  1. The languages supported by the agent should be Python, Scala, Terraform, Cloudformation, SAM, Shell and SQL. Remove support for generic code review agent and tighten the support for these languages. 
+  2. Enforce code formatting standards appropiate to the language being reviewed                                                                                                                                            
+  3. Using correct types for the variables rather than using broad types like Any or String. Ensure the code creates proper data types to represent entities.                                                       
+  4. Redundancy in tests - look for redundant tests and highlight opportunities for merging similar tests together                                                                                                  
+  5. If the project has a README, ensure the changes are correctly reflected in the README document 
+  6. Look for adherence to programming paradigms specific to the language and identify areas of optimiations related to code structuring to support extention of capabilities later without incurring major refactoring.

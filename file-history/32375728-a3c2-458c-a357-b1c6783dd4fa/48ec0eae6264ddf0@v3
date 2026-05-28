@@ -1,0 +1,29 @@
+from airflow import DAG
+from dns_helpers.dag_defaults import calculate_dag_defaults
+from dns_helpers.env_asset_loader import get_env
+from dns_operators.aws.lambda_async_operator import LambdaAsyncOperator
+
+env = get_env()
+
+with DAG(
+    "dns_de_rte_orchestrator_processor",
+    default_args=calculate_dag_defaults({"start_date": "2026-05-11"}),
+    catchup=False,
+    schedule_interval="*/30 * * * *",
+    tags=["rte", "erasure", "processor"],
+) as dag:
+    dag.doc_md = """
+### RTE Orchestrator Processor
+Invokes the `rte-orchestrator-processor` Lambda every 30 minutes to process
+pending right-to-erasure requests.
+"""
+
+    LambdaAsyncOperator(
+        task_id="invoke_rte_orchestrator_processor",
+        lambda_name=f"data-rte-orchestrator-process-requests-{env}",
+        payload_params={},
+        wait_for_success=True,
+        timeout=900,
+    )
+
+globals()[dag.dag_id] = dag

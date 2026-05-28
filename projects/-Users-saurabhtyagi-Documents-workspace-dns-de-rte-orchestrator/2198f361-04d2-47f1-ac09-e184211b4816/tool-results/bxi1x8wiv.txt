@@ -1,0 +1,1111 @@
+diff --git a/.gitignore b/.gitignore
+index 7b92680..28ff6ff 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -320,3 +320,6 @@ report.xml
+ .aws-sam-requirements.txt
+ # Ignore build folder
+ .aws-sam/
++
++# Local SAM debug fixtures (may contain real IDs or env-specific values)
++tests/fixtures/
+diff --git a/Makefile b/Makefile
+index fc9b124..b750b71 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # This is a Makefile for building packages to deploy to AWS with AWS SAM
+ .DEFAULT_GOAL := help
+ 
+-.PHONY: help clean build-CreateFunction build-ProcessFunction
++.PHONY: help clean build-CreateFunction build-ProcessFunction build-ReporterFunction
+ 
+ help: ## Show help
+ 	@echo "Usage: make [target]"
+@@ -19,5 +19,11 @@ build-ProcessFunction:
+ 	cp -r src/dns_de_rte_orchestrator "${ARTIFACTS_DIR}/"
+ 	rm -f .aws-sam-requirements.txt
+ 
++build-ReporterFunction:
++	uv export --no-dev --format requirements-txt -o .aws-sam-requirements.txt
++	uv pip install --python 3.13 --target "${ARTIFACTS_DIR}/" -r .aws-sam-requirements.txt
++	cp -r src/dns_de_rte_orchestrator "${ARTIFACTS_DIR}/"
++	rm -f .aws-sam-requirements.txt
++
+ clean:
+ 	rm -f .aws-sam-requirements.txt
+diff --git a/TODO.md b/TODO.md
+index f529210..f8b262b 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -53,9 +53,11 @@ project. It is intended to help guide human and AI agents:
+ - [x] Add audit logging
+   - [x] Add audit logging implementation that uses DynamoDB
+   - [x] Add audit logging calls to existing code
+-- [x] Add audit logging tests
+-- [ ] Add audit logging retrieval functionality
+-- [ ] Add audit logging materialising to S3 after successful erasure
++  - [x] Add audit logging tests
++  - [x] Add audit logging retrieval 
++    - [x] Create an API endpoint to get audit log for an erasure id
++    - [x] Create a new lambda to handle audit retrieval functionality
++  - [ ] Add audit logging materialising to S3 after successful erasure
+ - [x] Add `.gitlab-ci.yml` and enable GitLab CI/CD
+ - [x] Make sure tests are run in CI/CD
+ - [x] Make sure tests only run in CI/CD when code changes happen
+diff --git a/pyproject.toml b/pyproject.toml
+index cc8b4c7..4d10ea8 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -25,6 +25,7 @@ build-backend = "uv_build"
+ dev = [
+     "basedpyright>=1.39.2",
+     "black>=26.3.1",
++    "boto3-stubs~=1.43.7",
+     "debugpy>=1.8.20",
+     "moto[dynamodb,s3]>=5.1.22",
+     "prek>=0.3.9",
+diff --git a/samconfig.toml b/samconfig.toml
+index c95756a..dce66b4 100644
+--- a/samconfig.toml
++++ b/samconfig.toml
+@@ -31,6 +31,8 @@ parameter_overrides = """
+   AuditLogDynamoDBTable=rte-orchestrator-audit-dev
+   VPCEndpointId={{resolve:ssm:/dns/de/rte-orchestrator/prod/vpce-id}}
+   DryRunMode=false
++  AuditLogS3Bucket=hbi-dns-dev-rte
++  AuditLogS3Prefix=audit_log
+ """
+ 
+ [prod.deploy.parameters]
+@@ -58,4 +60,6 @@ parameter_overrides = """
+   AuditLogDynamoDBTable=rte-orchestrator-audit-prod
+   VPCEndpointId={{resolve:ssm:/dns/de/rte-orchestrator/prod/vpce-id}}
+   DryRunMode=false
++  AuditLogS3Bucket=hbi-dns-rte
++  AuditLogS3Prefix=audit_log
+ """
+diff --git a/src/dns_de_rte_orchestrator/audit_logging.py b/src/dns_de_rte_orchestrator/audit_logging.py
+index fae6cfa..966bbb2 100644
+--- a/src/dns_de_rte_orchestrator/audit_logging.py
++++ b/src/dns_de_rte_orchestrator/audit_logging.py
+@@ -1,19 +1,53 @@
++import gzip
++import json
+ import logging
+ import os
+ from abc import ABC, abstractmethod
++from dataclasses import dataclass
+ from datetime import datetime, timezone
+-from typing import TYPE_CHECKING, Any, Literal, override
++from typing import TYPE_CHECKING, Any, ClassVar, Literal, override
+ 
+ import boto3
++from botocore.exceptions import ClientError
+ 
+ if TYPE_CHECKING:
+     from types_boto3_dynamodb.client import DynamoDBClient
++    from types_boto3_s3.client import S3Client
+ else:
+     DynamoDBClient = Any
++    S3Client = Any
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++@dataclass(frozen=True)
++class AuditEntry:
++    """A single audit log entry for an erasure request."""
++
++    ID_FIELD: ClassVar[Literal["id"]] = "id"
++    TIMESTAMP_FIELD: ClassVar[Literal["timestamp"]] = "timestamp"
++    MESSAGE_FIELD: ClassVar[Literal["message"]] = "message"
++
++    id: str
++    timestamp: datetime
++    message: str
++
++    def to_json(self) -> dict[str, str]:
++        return {
++            self.ID_FIELD: self.id,
++            self.TIMESTAMP_FIELD: self.timestamp.isoformat(),
++            self.MESSAGE_FIELD: self.message,
++        }
++
++    @classmethod
++    def from_json(cls, data: dict[str, str]) -> "AuditEntry":
++        return cls(
++            id=data[cls.ID_FIELD],
++            timestamp=datetime.fromisoformat(data[cls.TIMESTAMP_FIELD]),
++            message=data[cls.MESSAGE_FIELD],
++        )
++
++
+ class AuditLogger(ABC):
+     """Base interface for audit logging"""
+ 
+@@ -32,6 +66,16 @@ class AuditLogger(ABC):
+         """
+         raise NotImplementedError()
+ 
++    @abstractmethod
++    def get_logs(self, id: str) -> list[AuditEntry]:
++        """
++        Retrieve all audit log entries for the given erasure id.
++
++        Entries are returned in chronological order (oldest first). Returns
++        an empty list if no entries exist for the id.
++        """
++        raise NotImplementedError()
++
+ 
+ class NoOpAuditLogger(AuditLogger):
+     """Audit logger implementation that does nothing"""
+@@ -41,6 +85,10 @@ class NoOpAuditLogger(AuditLogger):
+         logger.warning("Audit message not saved anywhere: %s", message)
+         pass
+ 
++    @override
++    def get_logs(self, id: str) -> list[AuditEntry]:
++        return []
++
+ 
+ class InMemoryAuditLogger(AuditLogger):
+     """Example implementation of audit logging by storing messages in memory"""
+@@ -57,14 +105,20 @@ class InMemoryAuditLogger(AuditLogger):
+             timestamp = timestamp.replace(tzinfo=timezone.utc)
+         self.memory_log.append(((id, timestamp), message))
+ 
++    @override
++    def get_logs(self, id: str) -> list[AuditEntry]:
++        entries = [
++            AuditEntry(id=entry_id, timestamp=ts, message=msg)
++            for ((entry_id, ts), msg) in self.memory_log
++            if entry_id == id
++        ]
++        entries.sort(key=lambda e: e.timestamp)
++        return entries
++
+ 
+ class DynamoDBAuditLogger(AuditLogger):
+     """DynamoDB backed audit logging"""
+ 
+-    ID_FIELD: Literal["id"] = "id"
+-    TIMESTAMP_FIELD: Literal["timestamp"] = "timestamp"
+-    MESSAGE_FIELD: Literal["message"] = "message"
+-
+     def __init__(self, table_name: str, dynamodb: DynamoDBClient) -> None:
+         super().__init__()
+         self.table_name: str = table_name
+@@ -84,22 +138,111 @@ class DynamoDBAuditLogger(AuditLogger):
+         )
+         logger.info("Audit Message sent: %s", message)
+ 
++    @override
++    def get_logs(self, id: str) -> list[AuditEntry]:
++        paginator = self.dynamodb.get_paginator("query")
++        pages = paginator.paginate(
++            TableName=self.table_name,
++            KeyConditionExpression="#id = :id",
++            ExpressionAttributeNames={"#id": AuditEntry.ID_FIELD},
++            ExpressionAttributeValues={":id": {"S": id}},
++            ScanIndexForward=True,
++        )
++        results: list[AuditEntry] = []
++        for page in pages:
++            if "Items" not in page:
++                continue
++            for item in page["Items"]:
++                results.append(self._item_to_entry(item))
++        return results
++
+     @classmethod
+     def _create_item(cls, id: str, message: str, timestamp: datetime):
+         timestamp_ms: int = int(timestamp.timestamp() * 1000)
+         item = {
+-            cls.ID_FIELD: {"S": id},
+-            cls.TIMESTAMP_FIELD: {"N": str(timestamp_ms)},
+-            cls.MESSAGE_FIELD: {"S": message},
++            AuditEntry.ID_FIELD: {"S": id},
++            AuditEntry.TIMESTAMP_FIELD: {"N": str(timestamp_ms)},
++            AuditEntry.MESSAGE_FIELD: {"S": message},
+         }
+         return item
+ 
++    @classmethod
++    def _item_to_entry(cls, item: dict[str, Any]) -> AuditEntry:  # pyright: ignore[reportExplicitAny]
++        id_value: str = item[AuditEntry.ID_FIELD]["S"]  # pyright: ignore[reportAny]
++        timestamp_ms: int = int(item[AuditEntry.TIMESTAMP_FIELD]["N"])  # pyright: ignore[reportAny]
++        message: str = item[AuditEntry.MESSAGE_FIELD]["S"]  # pyright: ignore[reportAny]
++        timestamp: datetime = datetime.fromtimestamp(
++            timestamp_ms / 1000, tz=timezone.utc
++        )
++        return AuditEntry(id=id_value, timestamp=timestamp, message=message)
++
++
++class S3AuditLogReader:
++    """Reads materialised audit logs from S3.
++
++    Each erasure request's complete audit log is stored as a single gzipped
++    JSON Lines object at ``s3://{bucket}/{prefix}/{id}.jsonl.gz``.
++    """
++
++    def __init__(self, bucket: str, prefix: str, s3_client: S3Client) -> None:
++        self.bucket: str = bucket
++        self.prefix: str = prefix.strip("/")
++        self.s3: S3Client = s3_client
++
++    def _key_for(self, id: str) -> str:
++        if self.prefix:
++            return f"{self.prefix}/{id}.jsonl.gz"
++        return f"{id}.jsonl.gz"
++
++    def get_logs(self, id: str) -> list[AuditEntry]:
++        key = self._key_for(id)
++        try:
++            response = self.s3.get_object(Bucket=self.bucket, Key=key)
++        except ClientError as e:
++            error_code = e.response.get("Error", {}).get("Code", "")
++            if error_code in ("NoSuchKey", "404", "NoSuchBucket"):
++                return []
++            raise
++
++        body_bytes: bytes = response["Body"].read()
++        decompressed = gzip.decompress(body_bytes).decode("utf-8")
++        entries: list[AuditEntry] = []
++        for line in decompressed.splitlines():
++            stripped = line.strip()
++            if not stripped:
++                continue
++            entries.append(AuditEntry.from_json(json.loads(stripped)))  # pyright: ignore[reportAny]
++        return entries
++
++
++class FallbackAuditLogReader:
++    """Reads audit logs from a primary source, falling back to S3 when empty."""
++
++    def __init__(self, primary: AuditLogger, fallback: S3AuditLogReader) -> None:
++        self.primary: AuditLogger = primary
++        self.fallback: S3AuditLogReader = fallback
++
++    def get_logs(self, id: str) -> list[AuditEntry]:
++        primary_results = self.primary.get_logs(id)
++        if primary_results:
++            return primary_results
++        logger.info(
++            "No audit logs found in primary store for id %s, falling back to S3", id
++        )
++        return self.fallback.get_logs(id)
++
+ 
+ DYNAMO_DB_AUDIT_LOGGING_TABLE: Literal["DYNAMO_DB_AUDIT_LOGGING_TABLE"] = (
+     "DYNAMO_DB_AUDIT_LOGGING_TABLE"
+ )
+ """Environment variable used for configuring the audit logging table"""
+ 
++AUDIT_LOG_S3_BUCKET: Literal["AUDIT_LOG_S3_BUCKET"] = "AUDIT_LOG_S3_BUCKET"
++"""Environment variable used for the S3 bucket holding materialised audit logs"""
++
++AUDIT_LOG_S3_PREFIX: Literal["AUDIT_LOG_S3_PREFIX"] = "AUDIT_LOG_S3_PREFIX"
++"""Environment variable used for the key prefix of materialised audit logs"""
++
+ 
+ def get_audit_logger() -> AuditLogger:
+     """Get a concrete audit logger via environment variables"""
+@@ -114,3 +257,25 @@ def get_audit_logger() -> AuditLogger:
+ def get_dynamodb_audit_logger(table_name: str) -> DynamoDBAuditLogger:
+     dynamodb: DynamoDBClient = boto3.client("dynamodb")
+     return DynamoDBAuditLogger(table_name, dynamodb)
++
++
++def get_s3_audit_log_reader(bucket: str, prefix: str) -> S3AuditLogReader:
++    s3: S3Client = boto3.client("s3")
++    return S3AuditLogReader(bucket=bucket, prefix=prefix, s3_client=s3)
++
++
++def get_audit_log_reader() -> FallbackAuditLogReader:
++    """Get an audit log reader configured from environment variables.
++
++    Uses the DynamoDB-backed audit logger as the primary source and an S3
++    reader as the fallback. Both must be configured via environment.
++    """
++    primary: AuditLogger = get_audit_logger()
++
++    bucket: str | None = os.getenv(AUDIT_LOG_S3_BUCKET)
++    if bucket is None or bucket == "":
++        raise ValueError(f"{AUDIT_LOG_S3_BUCKET} was not set")
++    prefix: str = os.getenv(AUDIT_LOG_S3_PREFIX, "")
++
++    fallback = get_s3_audit_log_reader(bucket=bucket, prefix=prefix)
++    return FallbackAuditLogReader(primary=primary, fallback=fallback)
+diff --git a/template.yaml b/template.yaml
+index 4c5c2d0..6a51c7a 100644
+--- a/template.yaml
++++ b/template.yaml
+@@ -24,6 +24,12 @@ Parameters:
+   DryRunMode:
+     Description: Whether to deploy in Dry Run mode or not
+     Type: String
++  AuditLogS3Bucket:
++    Description: S3 bucket holding materialised audit logs (one .jsonl.gz per erasure id)
++    Type: String
++  AuditLogS3Prefix:
++    Description: Key prefix within the S3 bucket for materialised audit logs
++    Type: String
+ 
+ Resources:
+   CreateServerlessAccessManager:
+@@ -105,6 +111,7 @@ Resources:
+ 
+   CreateRequestApiKey:
+     Type: AWS::ApiGateway::ApiKey
++    # noinspection YamlUnresolvedReferences
+     DependsOn: CreateRequestApiStage
+     Properties:
+       Name: !Sub "rte-orchestrator-api-key-${Environment}"
+@@ -113,6 +120,7 @@ Resources:
+ 
+   CreateRequestUsagePlan:
+     Type: AWS::ApiGateway::UsagePlan
++    # noinspection YamlUnresolvedReferences
+     DependsOn: CreateRequestApiStage
+     Properties:
+       UsagePlanName: !Sub "rte-orchestrator-usage-plan-${Environment}"
+@@ -179,6 +187,64 @@ Resources:
+           # contains erasure_details (PII: email, name, postcode), which
+           # should not be persisted in CloudWatch logs.
+ 
++  ReporterServerlessAccessManager:
++    Type: Custom::ServerlessAccessManager
++    Properties:
++      ServiceToken: !Sub "arn:aws:lambda:eu-west-1:${AWS::AccountId}:function:paas-serverless-access-manager"
++      FunctionName: !Sub 'data-rte-orchestrator-status-${Environment}'
++      VpcExecution: "true"
++      DatadogLogging: "true"
++      Targets:
++        AuditLogDynamoDBTable:
++          Type: DynamoDB
++          Properties:
++            Table: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditLogDynamoDBTable}"
++
++  ReporterS3ReadPolicy:
++    Type: AWS::IAM::Policy
++    Properties:
++      PolicyName: !Sub "rte-orchestrator-reporter-s3-read-${Environment}"
++      PolicyDocument:
++        Version: "2012-10-17"
++        Statement:
++          - Effect: Allow
++            Action: s3:GetObject
++            Resource: !Sub "arn:aws:s3:::${AuditLogS3Bucket}/${AuditLogS3Prefix}/*"
++      Roles:
++        - !GetAtt ReporterServerlessAccessManager.LambdaExecutionRoleName
++
++  ReporterFunction:
++    Type: AWS::Serverless::Function
++    Metadata:
++      BuildMethod: makefile
++    Properties:
++      FunctionName: !GetAtt ReporterServerlessAccessManager.FunctionName
++      CodeUri: ./
++      Handler: dns_de_rte_orchestrator.reporter_lambda.lambda_handler
++      Runtime: python3.13
++      Tracing: Active
++      Description: Retrieve audit log for an RTE erasure request
++      MemorySize: 256
++      Timeout: 30
++      ReservedConcurrentExecutions: 5
++      VpcConfig: !GetAtt ReporterServerlessAccessManager.VpcConfig
++      Role: !GetAtt ReporterServerlessAccessManager.LambdaExecutionRoleArn
++      Environment:
++        Variables:
++          DYNAMO_DB_AUDIT_LOGGING_TABLE: !Ref AuditLogDynamoDBTable
++          AUDIT_LOG_S3_BUCKET: !Ref AuditLogS3Bucket
++          AUDIT_LOG_S3_PREFIX: !Ref AuditLogS3Prefix
++          POWERTOOLS_SERVICE_NAME: !Sub "status-erasure-request-${Environment}"
++      Events:
++        GetErasureStatus:
++          Type: Api
++          Properties:
++            RestApiId: !Ref CreateRequestApi
++            Path: /status/{id}
++            Method: get
++            Auth:
++              ApiKeyRequired: true
++
+ Outputs:
+   CreateRequestApiInvokeUrl:
+     Description: Invoke URL for the RTE create-request API
+@@ -186,3 +252,6 @@ Outputs:
+   CreateRequestApiKeyId:
+     Description: ID of the API key required to invoke the RTE create-request API (retrieve value from API Gateway console)
+     Value: !Ref CreateRequestApiKey
++  GetStatusApiInvokeUrl:
++    Description: Invoke URL for the GET /status/{id} API endpoint
++    Value: !Sub "https://${CreateRequestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/status/{id}"
+diff --git a/tests/test_audit_logging.py b/tests/test_audit_logging.py
+index 9be7183..06fc84e 100644
+--- a/tests/test_audit_logging.py
++++ b/tests/test_audit_logging.py
+@@ -1,27 +1,54 @@
++import gzip
++import json
+ from datetime import datetime, timedelta, timezone
+-from typing import cast
++from typing import Any, cast
++from unittest.mock import MagicMock
+ 
++import pytest
+ from pytest import MonkeyPatch
+ from types_boto3_dynamodb.client import DynamoDBClient
+ 
+ from dns_de_rte_orchestrator.audit_logging import (
++    AUDIT_LOG_S3_BUCKET,
++    AUDIT_LOG_S3_PREFIX,
+     DYNAMO_DB_AUDIT_LOGGING_TABLE,
++    AuditEntry,
+     DynamoDBAuditLogger,
++    FallbackAuditLogReader,
+     InMemoryAuditLogger,
+     NoOpAuditLogger,
++    S3AuditLogReader,
++    get_audit_log_reader,
+     get_audit_logger,
+     get_dynamodb_audit_logger,
++    get_s3_audit_log_reader,
+ )
+ 
+ 
++class StubDynamoDBPaginator:
++    def __init__(self, pages: list[dict[str, Any]]) -> None:
++        self._pages = pages
++
++    def paginate(self, **kwargs: Any) -> list[dict[str, Any]]:
++        self._last_kwargs = kwargs
++        return self._pages
++
++
+ class StubDynamoDBClient:
+-    def __init__(self) -> None:
++    def __init__(self, query_pages: list[dict[str, Any]] | None = None) -> None:
+         self.put_item_calls: list[dict[str, object]] = []
++        self._query_pages = query_pages or []
++        self._paginator: StubDynamoDBPaginator | None = None
+ 
+     def put_item(self, **kwargs: object) -> dict[str, object]:
+         self.put_item_calls.append(kwargs)
+         return {}
+ 
++    def get_paginator(self, operation: str) -> StubDynamoDBPaginator:
++        assert operation == "query"
++        self._paginator = StubDynamoDBPaginator(self._query_pages)
++        return self._paginator
++
+ 
+ def stub_get_dynamodb_audit_logger(
+     table_name: str, expected: DynamoDBAuditLogger
+@@ -37,11 +64,27 @@ def stub_boto3_client(
+     return client
+ 
+ 
++def _make_gzipped_jsonl(entries: list[dict[str, str]]) -> bytes:
++    lines = "\n".join(json.dumps(e) for e in entries)
++    return gzip.compress(lines.encode("utf-8"))
++
++
++# --- NoOpAuditLogger ---
++
++
+ def test_no_op_log():
+     audit = NoOpAuditLogger()
+     audit.log("id", "message")
+ 
+ 
++def test_no_op_get_logs_returns_empty():
++    audit = NoOpAuditLogger()
++    assert audit.get_logs("any-id") == []
++
++
++# --- InMemoryAuditLogger ---
++
++
+ def test_in_memory_log():
+     before_tests = datetime.now(timezone.utc)
+     audit = InMemoryAuditLogger()
+@@ -60,9 +103,7 @@ def test_in_memory_log():
+     audit.log(id, message)
+     assert len(audit.memory_log) == 2
+     found_entry = audit.memory_log[1]
+-    # make sure the timestamp exists and is sensible
+     assert found_entry[0][1] >= before_tests
+-    # Assert the entries are what we expect
+     assert found_entry[0][0] == id
+     assert found_entry[1] == message
+ 
+@@ -79,12 +120,49 @@ def test_in_memory_log_change_timezone():
+     audit.log(id, message, timestamp)
+     assert len(audit.memory_log) == 1
+ 
+-    # Make sure the timestamp differs
+     assert audit.memory_log[0] != ((id, timestamp), message)
+     utc_timestamp = timestamp.replace(tzinfo=timezone.utc)
+     assert audit.memory_log[0] == ((id, utc_timestamp), message)
+ 
+ 
++def test_in_memory_get_logs_returns_entries_for_id():
++    audit = InMemoryAuditLogger()
++    ts1 = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
++    ts2 = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
++    audit.log("req-1", "first", ts1)
++    audit.log("req-2", "other", ts1)
++    audit.log("req-1", "second", ts2)
++
++    results = audit.get_logs("req-1")
++
++    assert len(results) == 2
++    assert results[0].message == "first"
++    assert results[1].message == "second"
++
++
++def test_in_memory_get_logs_returns_chronological_order():
++    audit = InMemoryAuditLogger()
++    ts_late = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
++    ts_early = datetime(2026, 1, 1, 9, 0, 0, tzinfo=timezone.utc)
++    # Log out of order
++    audit.log("req-1", "late message", ts_late)
++    audit.log("req-1", "early message", ts_early)
++
++    results = audit.get_logs("req-1")
++
++    assert [e.message for e in results] == ["early message", "late message"]
++
++
++def test_in_memory_get_logs_returns_empty_for_unknown_id():
++    audit = InMemoryAuditLogger()
++    audit.log("req-1", "some message")
++
++    assert audit.get_logs("unknown-id") == []
++
++
++# --- DynamoDBAuditLogger ---
++
++
+ def test_dynamodb_audit_logger_create_item_serializes_fields():
+     timestamp = datetime(2026, 5, 7, 14, 30, 45, 123000, tzinfo=timezone.utc)
+ 
+@@ -146,6 +224,272 @@ def test_dynamodb_audit_logger_log_relabels_non_utc_timestamp_before_writing():
+     ]
+ 
+ 
++def test_dynamodb_audit_logger_get_logs_queries_by_id():
++    ts_ms = 1778164245000
++    pages = [
++        {
++            "Items": [
++                {
++                    "id": {"S": "req-1"},
++                    "timestamp": {"N": str(ts_ms)},
++                    "message": {"S": "msg"},
++                },
++            ]
++        }
++    ]
++    client = StubDynamoDBClient(query_pages=pages)
++    logger = DynamoDBAuditLogger(
++        table_name="audit-table",
++        dynamodb=cast(DynamoDBClient, cast(object, client)),
++    )
++
++    results = logger.get_logs("req-1")
++
++    assert len(results) == 1
++    assert results[0].id == "req-1"
++    assert results[0].message == "msg"
++    expected_ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
++    assert results[0].timestamp == expected_ts
++
++    assert client._paginator is not None
++    last_kwargs = (
++        client._paginator._last_kwargs
++    )  # pyright: ignore[reportAttributeAccessIssue]
++    assert last_kwargs["KeyConditionExpression"] == "#id = :id"
++    assert last_kwargs["ExpressionAttributeValues"] == {":id": {"S": "req-1"}}
++    assert last_kwargs["ScanIndexForward"] is True
++
++
++def test_dynamodb_audit_logger_get_logs_paginates():
++    ts1 = 1778164245000
++    ts2 = 1778164305000
++    pages = [
++        {
++            "Items": [
++                {
++                    "id": {"S": "req-1"},
++                    "timestamp": {"N": str(ts1)},
++                    "message": {"S": "first"},
++                }
++            ]
++        },
++        {
++            "Items": [
++                {
++                    "id": {"S": "req-1"},
++                    "timestamp": {"N": str(ts2)},
++                    "message": {"S": "second"},
++                }
++            ]
++        },
++    ]
++    client = StubDynamoDBClient(query_pages=pages)
++    logger = DynamoDBAuditLogger(
++        table_name="audit-table",
++        dynamodb=cast(DynamoDBClient, cast(object, client)),
++    )
++
++    results = logger.get_logs("req-1")
++
++    assert [e.message for e in results] == ["first", "second"]
++
++
++def test_dynamodb_audit_logger_get_logs_returns_empty_when_no_items():
++    client = StubDynamoDBClient(query_pages=[{"Items": []}])
++    logger = DynamoDBAuditLogger(
++        table_name="audit-table",
++        dynamodb=cast(DynamoDBClient, cast(object, client)),
++    )
++
++    assert logger.get_logs("req-1") == []
++
++
++def test_dynamodb_audit_logger_get_logs_handles_page_without_items_key():
++    client = StubDynamoDBClient(query_pages=[{}])
++    logger = DynamoDBAuditLogger(
++        table_name="audit-table",
++        dynamodb=cast(DynamoDBClient, cast(object, client)),
++    )
++
++    assert logger.get_logs("req-1") == []
++
++
++# --- AuditEntry ---
++
++
++def test_audit_entry_to_json():
++    ts = datetime(2026, 5, 7, 14, 30, 45, tzinfo=timezone.utc)
++    entry = AuditEntry(id="req-1", timestamp=ts, message="hello")
++
++    result = entry.to_json()
++
++    assert result == {
++        "id": "req-1",
++        "timestamp": "2026-05-07T14:30:45+00:00",
++        "message": "hello",
++    }
++
++
++# --- S3AuditLogReader ---
++
++
++def _make_stub_s3(body: bytes | None = None, error_code: str | None = None) -> Any:
++    """Return a minimal stub for boto3 S3 client."""
++    from botocore.exceptions import ClientError
++
++    stub = MagicMock()
++    if error_code:
++        stub.get_object.side_effect = ClientError(
++            {"Error": {"Code": error_code, "Message": ""}}, "GetObject"
++        )
++    elif body is not None:
++        response_body = MagicMock()
++        response_body.read.return_value = body
++        stub.get_object.return_value = {"Body": response_body}
++    return stub
++
++
++def test_s3_reader_returns_entries_from_gzipped_jsonl():
++    ts = "2026-05-07T14:30:45+00:00"
++    data = _make_gzipped_jsonl(
++        [
++            {"id": "req-1", "timestamp": ts, "message": "first"},
++            {
++                "id": "req-1",
++                "timestamp": "2026-05-07T15:00:00+00:00",
++                "message": "second",
++            },
++        ]
++    )
++    s3 = _make_stub_s3(body=data)
++    reader = S3AuditLogReader(bucket="my-bucket", prefix="audit", s3_client=s3)
++
++    results = reader.get_logs("req-1")
++
++    assert len(results) == 2
++    assert results[0].message == "first"
++    assert results[1].message == "second"
++    s3.get_object.assert_called_once_with(
++        Bucket="my-bucket", Key="audit/req-1.jsonl.gz"
++    )
++
++
++def test_s3_reader_uses_prefix_in_key():
++    data = _make_gzipped_jsonl(
++        [{"id": "x", "timestamp": "2026-01-01T00:00:00+00:00", "message": "m"}]
++    )
++    s3 = _make_stub_s3(body=data)
++    reader = S3AuditLogReader(bucket="bucket", prefix="some/prefix", s3_client=s3)
++
++    reader.get_logs("x")
++
++    s3.get_object.assert_called_once_with(Bucket="bucket", Key="some/prefix/x.jsonl.gz")
++
++
++def test_s3_reader_strips_trailing_slash_from_prefix():
++    data = _make_gzipped_jsonl(
++        [{"id": "x", "timestamp": "2026-01-01T00:00:00+00:00", "message": "m"}]
++    )
++    s3 = _make_stub_s3(body=data)
++    reader = S3AuditLogReader(bucket="bucket", prefix="some/prefix/", s3_client=s3)
++
++    reader.get_logs("x")
++
++    s3.get_object.assert_called_once_with(Bucket="bucket", Key="some/prefix/x.jsonl.gz")
++
++
++def test_s3_reader_empty_prefix_omits_slash():
++    data = _make_gzipped_jsonl(
++        [{"id": "x", "timestamp": "2026-01-01T00:00:00+00:00", "message": "m"}]
++    )
++    s3 = _make_stub_s3(body=data)
++    reader = S3AuditLogReader(bucket="bucket", prefix="", s3_client=s3)
++
++    reader.get_logs("x")
++
++    s3.get_object.assert_called_once_with(Bucket="bucket", Key="x.jsonl.gz")
++
++
++def test_s3_reader_returns_empty_on_no_such_key():
++    s3 = _make_stub_s3(error_code="NoSuchKey")
++    reader = S3AuditLogReader(bucket="bucket", prefix="pfx", s3_client=s3)
++
++    assert reader.get_logs("missing-id") == []
++
++
++def test_s3_reader_returns_empty_on_no_such_bucket():
++    s3 = _make_stub_s3(error_code="NoSuchBucket")
++    reader = S3AuditLogReader(bucket="bucket", prefix="pfx", s3_client=s3)
++
++    assert reader.get_logs("any-id") == []
++
++
++def test_s3_reader_propagates_other_client_errors():
++    s3 = _make_stub_s3(error_code="AccessDenied")
++    reader = S3AuditLogReader(bucket="bucket", prefix="pfx", s3_client=s3)
++
++    from botocore.exceptions import ClientError
++
++    with pytest.raises(ClientError):
++        reader.get_logs("req-1")
++
++
++def test_s3_reader_raises_on_malformed_json():
++    bad_bytes = gzip.compress(
++        b'{"id": "x", "timestamp": "2026-01-01T00:00:00+00:00"\n{bad line'
++    )
++    s3 = _make_stub_s3(body=bad_bytes)
++    reader = S3AuditLogReader(bucket="bucket", prefix="pfx", s3_client=s3)
++
++    with pytest.raises(json.JSONDecodeError):
++        reader.get_logs("x")
++
++
++# --- FallbackAuditLogReader ---
++
++
++def test_fallback_reader_returns_primary_when_non_empty():
++    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
++    primary = InMemoryAuditLogger()
++    primary.log("req-1", "primary entry", ts)
++
++    fallback_s3 = MagicMock(spec=S3AuditLogReader)
++
++    reader = FallbackAuditLogReader(primary=primary, fallback=fallback_s3)
++    results = reader.get_logs("req-1")
++
++    assert len(results) == 1
++    assert results[0].message == "primary entry"
++    fallback_s3.get_logs.assert_not_called()
++
++
++def test_fallback_reader_falls_back_to_s3_when_primary_empty():
++    primary = InMemoryAuditLogger()
++    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
++    expected = [AuditEntry(id="req-1", timestamp=ts, message="s3 entry")]
++
++    fallback_s3 = MagicMock(spec=S3AuditLogReader)
++    fallback_s3.get_logs.return_value = expected
++
++    reader = FallbackAuditLogReader(primary=primary, fallback=fallback_s3)
++    results = reader.get_logs("req-1")
++
++    assert results == expected
++    fallback_s3.get_logs.assert_called_once_with("req-1")
++
++
++def test_fallback_reader_returns_empty_when_both_empty():
++    primary = InMemoryAuditLogger()
++    fallback_s3 = MagicMock(spec=S3AuditLogReader)
++    fallback_s3.get_logs.return_value = []
++
++    reader = FallbackAuditLogReader(primary=primary, fallback=fallback_s3)
++    assert reader.get_logs("req-1") == []
++
++
++# --- Factory functions ---
++
++
+ def test_get_audit_logger_returns_noop_logger_without_env(monkeypatch: MonkeyPatch):
+     monkeypatch.delenv(DYNAMO_DB_AUDIT_LOGGING_TABLE, raising=False)
+ 
+@@ -192,3 +536,49 @@ def test_get_dynamodb_audit_logger_builds_boto3_client(monkeypatch: MonkeyPatch)
+     assert isinstance(logger, DynamoDBAuditLogger)
+     assert logger.table_name == "audit-table"
+     assert logger.dynamodb is client
++
++
++def test_get_s3_audit_log_reader_builds_boto3_client(monkeypatch: MonkeyPatch):
++    s3_stub = MagicMock()
++    calls: list[str] = []
++
++    def fake_boto3_client(service_name: str) -> Any:
++        calls.append(service_name)
++        return s3_stub
++
++    monkeypatch.setattr(
++        "dns_de_rte_orchestrator.audit_logging.boto3.client", fake_boto3_client
++    )
++
++    reader = get_s3_audit_log_reader("my-bucket", "my-prefix")
++
++    assert isinstance(reader, S3AuditLogReader)
++    assert reader.bucket == "my-bucket"
++    assert reader.prefix == "my-prefix"
++    assert "s3" in calls
++
++
++def test_get_audit_log_reader_raises_without_s3_bucket(monkeypatch: MonkeyPatch):
++    monkeypatch.delenv(AUDIT_LOG_S3_BUCKET, raising=False)
++    monkeypatch.setenv(AUDIT_LOG_S3_PREFIX, "pfx")
++
++    with pytest.raises(ValueError, match=AUDIT_LOG_S3_BUCKET):
++        get_audit_log_reader()
++
++
++def test_get_audit_log_reader_uses_empty_prefix_by_default(monkeypatch: MonkeyPatch):
++    monkeypatch.setenv(AUDIT_LOG_S3_BUCKET, "my-bucket")
++    monkeypatch.delenv(AUDIT_LOG_S3_PREFIX, raising=False)
++    monkeypatch.setattr(
++        "dns_de_rte_orchestrator.audit_logging.boto3.client",
++        lambda _: MagicMock(),
++    )
++    monkeypatch.setattr(
++        "dns_de_rte_orchestrator.audit_logging.get_audit_logger",
++        lambda: NoOpAuditLogger(),
++    )
++
++    reader = get_audit_log_reader()
++
++    assert isinstance(reader, FallbackAuditLogReader)
++    assert reader.fallback.prefix == ""
+diff --git a/tests/test_dynamodb_audit_logger.py b/tests/test_dynamodb_audit_logger.py
+index 48d7ac7..765a9b8 100644
+--- a/tests/test_dynamodb_audit_logger.py
++++ b/tests/test_dynamodb_audit_logger.py
+@@ -8,7 +8,7 @@ from boto3.dynamodb.conditions import Key
+ from moto import mock_aws
+ from types_boto3_dynamodb.service_resource import Table
+ 
+-from dns_de_rte_orchestrator.audit_logging import DynamoDBAuditLogger
++from dns_de_rte_orchestrator.audit_logging import AuditEntry, DynamoDBAuditLogger
+ 
+ TEST_TABLE_NAME: Literal["test_audit_table"] = "test_audit_table"
+ 
+@@ -20,19 +20,19 @@ def dynamodb_table() -> Generator[Table, None, None]:
+         table = dynamodb.create_table(
+             TableName=TEST_TABLE_NAME,
+             KeySchema=[
+-                {"AttributeName": DynamoDBAuditLogger.ID_FIELD, "KeyType": "HASH"},
++                {"AttributeName": AuditEntry.ID_FIELD, "KeyType": "HASH"},
+                 {
+-                    "AttributeName": DynamoDBAuditLogger.TIMESTAMP_FIELD,
++                    "AttributeName": AuditEntry.TIMESTAMP_FIELD,
+                     "KeyType": "RANGE",
+                 },
+             ],
+             AttributeDefinitions=[
+                 {
+-                    "AttributeName": DynamoDBAuditLogger.ID_FIELD,
++                    "AttributeName": AuditEntry.ID_FIELD,
+                     "AttributeType": "S",
+                 },
+                 {
+-                    "AttributeName": DynamoDBAuditLogger.TIMESTAMP_FIELD,
++                    "AttributeName": AuditEntry.TIMESTAMP_FIELD,
+                     "AttributeType": "N",
+                 },
+             ],
+@@ -58,16 +58,16 @@ def test_log_persists_item_with_explicit_timestamp(dynamodb_table: Table):
+ 
+     result = dynamodb_table.get_item(
+         Key={
+-            DynamoDBAuditLogger.ID_FIELD: "req-123",
+-            DynamoDBAuditLogger.TIMESTAMP_FIELD: int(timestamp.timestamp() * 1000),
++            AuditEntry.ID_FIELD: "req-123",
++            AuditEntry.TIMESTAMP_FIELD: int(timestamp.timestamp() * 1000),
+         }
+     )
+ 
+     assert "Item" in result
+     item = result["Item"]
+-    assert item[DynamoDBAuditLogger.ID_FIELD] == "req-123"
+-    assert str(item[DynamoDBAuditLogger.TIMESTAMP_FIELD]) == "1778164245123"
+-    assert item[DynamoDBAuditLogger.MESSAGE_FIELD] == "audit message"
++    assert item[AuditEntry.ID_FIELD] == "req-123"
++    assert str(item[AuditEntry.TIMESTAMP_FIELD]) == "1778164245123"
++    assert item[AuditEntry.MESSAGE_FIELD] == "audit message"
+ 
+ 
+ def test_log_persists_item_with_generated_utc_timestamp(dynamodb_table: Table):
+@@ -80,15 +80,11 @@ def test_log_persists_item_with_generated_utc_timestamp(dynamodb_table: Table):
+     result = dynamodb_table.scan()
+ 
+     assert "Items" in result
+-    items = [
+-        item
+-        for item in result["Items"]
+-        if item[DynamoDBAuditLogger.ID_FIELD] == "req-456"
+-    ]
++    items = [item for item in result["Items"] if item[AuditEntry.ID_FIELD] == "req-456"]
+     assert len(items) == 1
+     item = items[0]
+-    assert item[DynamoDBAuditLogger.MESSAGE_FIELD] == "generated timestamp message"
+-    timestamp_ms = int(str(item[DynamoDBAuditLogger.TIMESTAMP_FIELD]))
++    assert item[AuditEntry.MESSAGE_FIELD] == "generated timestamp message"
++    timestamp_ms = int(str(item[AuditEntry.TIMESTAMP_FIELD]))
+     assert timestamp_ms >= int(before.timestamp() * 1000)
+     assert timestamp_ms <= int(after.timestamp() * 1000)
+ 
+@@ -105,15 +101,15 @@ def test_log_relabels_non_utc_timezone_before_persisting(dynamodb_table: Table):
+ 
+     result = dynamodb_table.get_item(
+         Key={
+-            DynamoDBAuditLogger.ID_FIELD: "req-789",
+-            DynamoDBAuditLogger.TIMESTAMP_FIELD: expected_timestamp_ms,
++            AuditEntry.ID_FIELD: "req-789",
++            AuditEntry.TIMESTAMP_FIELD: expected_timestamp_ms,
+         }
+     )
+ 
+     assert "Item" in result
+     item = result["Item"]
+-    assert str(item[DynamoDBAuditLogger.TIMESTAMP_FIELD]) == str(expected_timestamp_ms)
+-    assert item[DynamoDBAuditLogger.MESSAGE_FIELD] == "timezone message"
++    assert str(item[AuditEntry.TIMESTAMP_FIELD]) == str(expected_timestamp_ms)
++    assert item[AuditEntry.MESSAGE_FIELD] == "timezone message"
+ 
+ 
+ def test_log_allows_multiple_entries_for_same_id(dynamodb_table: Table):
+@@ -125,13 +121,52 @@ def test_log_allows_multiple_entries_for_same_id(dynamodb_table: Table):
+     logger.log("req-repeat", "second message", second_timestamp)
+ 
+     result = dynamodb_table.query(
+-        KeyConditionExpression=Key(DynamoDBAuditLogger.ID_FIELD).eq("req-repeat")
++        KeyConditionExpression=Key(AuditEntry.ID_FIELD).eq("req-repeat")
+     )
+ 
+     assert "Items" in result
+     items = result["Items"]
+     assert len(items) == 2
+-    assert [item[DynamoDBAuditLogger.MESSAGE_FIELD] for item in items] == [
++    assert [item[AuditEntry.MESSAGE_FIELD] for item in items] == [
+         "first message",
+         "second message",
+     ]
++
++
++def test_get_logs_returns_chronological_entries(dynamodb_table: Table):
++    logger = build_audit_logger()
++    ts1 = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
++    ts2 = datetime(2026, 5, 7, 11, 0, 0, tzinfo=timezone.utc)
++    ts3 = datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc)
++
++    logger.log("req-chrono", "first", ts1)
++    logger.log("req-chrono", "third", ts3)
++    logger.log("req-chrono", "second", ts2)
++
++    results = logger.get_logs("req-chrono")
++
++    assert len(results) == 3
++    assert [e.message for e in results] == ["first", "second", "third"]
++    assert results[0].timestamp == ts1
++    assert results[1].timestamp == ts2
++    assert results[2].timestamp == ts3
++
++
++def test_get_logs_returns_only_entries_for_requested_id(dynamodb_table: Table):
++    logger = build_audit_logger()
++    ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
++
++    logger.log("req-a", "entry for a", ts)
++    logger.log("req-b", "entry for b", ts)
++
++    results = logger.get_logs("req-a")
++
++    assert len(results) == 1
++    assert results[0].id == "req-a"
++    assert results[0].message == "entry for a"
++
++
++def test_get_logs_returns_empty_for_unknown_id(dynamodb_table: Table):
++    logger = build_audit_logger()
++
++    assert logger.get_logs("no-such-id") == []
+diff --git a/uv.lock b/uv.lock
+index ae3bb96..a88ce04 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -125,6 +125,19 @@ crt = [
+     { name = "botocore", extra = ["crt"] },
+ ]
+ 
++[[package]]
++name = "boto3-stubs"
++version = "1.43.10"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "botocore-stubs" },
++    { name = "types-s3transfer" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/0a/67/969b5bc0581ef6f22b2371bdc33d66a50fe907993e0528cb34a7f3fa59f7/boto3_stubs-1.43.10.tar.gz", hash = "sha256:05575658b827e7a12a45629e1a987317e1e679dccabe5ebde5a2101528c76cf8", size = 102665, upload-time = "2026-05-18T20:47:00.528Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/2b/42/90eb347eda878b15def1f0bb0971779b1829a0fc6b9c0fe3ff823de09833/boto3_stubs-1.43.10-py3-none-any.whl", hash = "sha256:0ce5dec421a45ef1b8ddd32e68d0b8bb78ea7447c5ddf8231420ccaa6e71e0f5", size = 70667, upload-time = "2026-05-18T20:46:54.359Z" },
++]
++
+ [[package]]
+ name = "botocore"
+ version = "1.43.7"
+@@ -442,6 +455,7 @@ dependencies = [
+ dev = [
+     { name = "basedpyright" },
+     { name = "black" },
++    { name = "boto3-stubs" },
+     { name = "debugpy" },
+     { name = "moto", extra = ["dynamodb", "s3"] },
+     { name = "prek" },
+@@ -464,6 +478,7 @@ requires-dist = [
+ dev = [
+     { name = "basedpyright", specifier = ">=1.39.2" },
+     { name = "black", specifier = ">=26.3.1" },
++    { name = "boto3-stubs", specifier = "~=1.43.7" },
+     { name = "debugpy", specifier = ">=1.8.20" },
+     { name = "moto", extras = ["dynamodb", "s3"], specifier = ">=5.1.22" },
+     { name = "prek", specifier = ">=0.3.9" },

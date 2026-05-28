@@ -1,0 +1,26 @@
+{
+  "httpMethod": "GET",
+  "path": "/status/req-abc-123",
+  "pathParameters": {
+    "id": "req-abc-123"
+  },
+  "queryStringParameters": null,
+  "multiValueQueryStringParameters": null,
+  "headers": {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "x-api-key": "local-dev-api-key"
+  },
+  "multiValueHeaders": {},
+  "requestContext": {
+    "resourcePath": "/status/{id}",
+    "httpMethod": "GET",
+    "stage": "local",
+    "requestId": "local-debug-request-id",
+    "identity": {
+      "sourceIp": "127.0.0.1"
+    }
+  },
+  "body": null,
+  "isBase64Encoded": false
+}

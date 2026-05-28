@@ -1,0 +1,161 @@
+# Address MR !60 review comments 2, 3, 4 and 8
+
+## Context
+
+MR !60 (`DATA-4716: Add audit log retrieval API endpoint`) has reviewer
+feedback from LyndonHB and ThomasWallace1. This plan addresses four of
+those comments:
+
+- **Comment 2** — Use `typing.Self` for `AuditEntry.from_json`'s return
+  annotation instead of the string literal `"AuditEntry"`, so it survives
+  refactoring.
+- **Comment 3** — Narrow the `item` parameter on
+  `DynamoDBAuditLogger._item_to_entry` to
+  `dict[str, AttributeValueTypeDef]` to remove the explicit `Any`.
+- **Comment 4** — Replace the `Any`-returning `_make_stub_s3` helper in
+  `tests/test_audit_logging.py` with a properly typed stub so the cascade
+  of `# pyright: ignore[reportAny]` comments around it can be removed.
+- **Comment 8** — Document the new `GET /status/{id}` audit log endpoint
+  in `README.md` with a `curl` example, as requested by ThomasWallace1.
+
+The intended outcome is a cleaner type story for the audit log code and
+discoverable user-facing documentation for the new endpoint, matching
+the conventions already established in `request_repository.py` and other
+projects in the org.
+
+## Changes
+
+### 1. `src/dns_de_rte_orchestrator/audit_logging.py` (Comments 2 & 3)
+
+**Imports**
+
+- Add `Self` to the existing `from typing import …` line (line 8).
+- Inside the existing `if TYPE_CHECKING:` block (lines 13–18), import
+  `AttributeValueTypeDef` from `types_boto3_dynamodb.type_defs`. Mirror
+  the pattern in `src/dns_de_rte_orchestrator/request_repository.py`
+  lines 9–18: in the `else:` branch, alias
+  `AttributeValueTypeDef = dict[str, Any]` (or similar) so runtime is
+  unaffected.
+
+**`AuditEntry.from_json` (line ~43)**
+
+Change:
+```python
+def from_json(cls, data: dict[str, str]) -> "AuditEntry":
+```
+to:
+```python
+def from_json(cls, data: dict[str, str]) -> Self:
+```
+
+**`DynamoDBAuditLogger._item_to_entry` (lines ~169–181)**
+
+Change the signature from
+`item: dict[str, Any]  # pyright: ignore[reportExplicitAny]` to
+`item: dict[str, AttributeValueTypeDef]` (no ignore needed).
+
+Replace the three `# pyright: ignore[reportAny]` comments on the `["S"]`
+and `["N"]` accesses with
+`# pyright: ignore[reportTypedDictNotRequiredAccess]`, matching the
+exact pattern used in `request_repository.py` lines 241–249.
+
+### 2. `tests/test_audit_logging.py` (Comment 4)
+
+The goal is to drop the `_make_stub_s3 -> Any` return type and the long
+trail of `# pyright: ignore[reportAny]` comments at every call site
+(lines ~373–476).
+
+Approach (single recommended option):
+
+- Change the helper's return type from `Any` to `S3Client` by importing
+  `S3Client` under `TYPE_CHECKING` (mirroring the pattern in
+  `audit_logging.py`) and using a `cast(S3Client, stub)` on the
+  `MagicMock` before returning.
+- Inside the helper, type the local `MagicMock` as `MagicMock` (no
+  `Any`) and assign `side_effect` / `return_value` directly — these are
+  attributes of `MagicMock` and don't need ignores once the outer type
+  is no longer `Any`.
+- After the change, remove every `# pyright: ignore[reportAny]` comment
+  that was needed only because the stub flowed through as `Any` (the
+  call sites that pass the stub into `S3AuditLogReader(s3_client=…)`
+  and the `assert_called_once_with` lines).
+- Apply the same treatment to `MagicMock(spec=S3AuditLogReader)` usages
+  in the `FallbackAuditLogReader` tests (lines ~491, 506, 518) — wrap
+  in `cast(S3AuditLogReader, mock)` so subsequent attribute accesses
+  type cleanly.
+- For `test_get_s3_audit_log_reader_builds_boto3_client` (line ~577) and
+  `test_get_audit_log_reader_uses_empty_prefix_by_default` (line ~611),
+  type `fake_boto3_client` to return `S3Client` via a cast, removing the
+  `reportAny` / `reportUnknownLambdaType` ignores.
+
+If a single ignore is unavoidable on a particular `MagicMock` attribute
+assignment (basedpyright is strict about `MagicMock` returning `Any`),
+keep it narrow and on a single line — but only after trying the cast
+approach first. The reviewer's hint (`object` / `Protocol` / `cast`)
+explicitly endorses `cast` as the lever, so the fallback is acceptable.
+
+No production behaviour changes; this is type-annotation cleanup only.
+
+### 3. `README.md` (Comment 8)
+
+Add a new top-level section, **"API"** (placed after "Project Goals"
+and before "Project Details"), describing the audit log retrieval
+endpoint exposed by `reporter_lambda`. Pattern after
+`template.yaml` lines 216–256:
+
+- HTTP method and route: `GET /status/{id}`
+- Authentication: requires the `x-api-key` header (private VPC API)
+- Example invocation (mirroring the project example in the original
+  reviewer comment):
+
+  ```sh
+  curl -k -sS -G \
+    'https://<api-id>.execute-api.eu-west-1.amazonaws.com/<env>/status/<id>' \
+    -H 'x-api-key: <api-key>'
+  ```
+
+- A brief note that the response is JSON: `{ "id": "...",
+  "entries": [{ "id", "timestamp", "message" }, ...] }` (matches
+  `AuditEntry.to_json()` in `audit_logging.py`).
+
+Keep the section short — one paragraph + the curl example + the
+response shape. No need to re-document deployment or the underlying
+Lambda.
+
+## Files modified
+
+- `src/dns_de_rte_orchestrator/audit_logging.py`
+- `tests/test_audit_logging.py`
+- `README.md`
+
+## Out of scope (other MR comments)
+
+- Comment 1 (`.gitignore` fixtures) — needs a separate decision on
+  whether to check fixtures in.
+- Comment 5 (`template.yaml` annotation) — already explained in reply.
+- Comment 6 (ServerlessAccessManager Target/Source) — already explained
+  in reply (intentional permission narrowing).
+- Comment 7 (concurrent executions tuning) — explicitly deferred by
+  reviewer.
+- Wiz scan findings — reviewer said safe to ignore for now.
+
+## Verification
+
+1. `uv sync --all-groups`
+2. `uv run prek` — must pass with no new lint or type errors. In
+   particular, `basedpyright` must not surface new `reportAny` /
+   `reportExplicitAny` issues, and the existing ones being cleaned up
+   should disappear.
+3. `uv run pytest` — full suite green. The audit-logging and reporter
+   lambda tests are the most exercised paths; pay attention to:
+   - `tests/test_audit_logging.py` (all S3 reader / fallback / factory
+     tests still pass after type tightening)
+   - `tests/test_dynamodb_audit_logger.py` (unchanged but exercises
+     `_item_to_entry` indirectly)
+   - `tests/test_reporter_lambda.py`
+4. `sam validate --lint` and `sam build` — should still succeed (no
+   template changes, but worth confirming since README-only changes
+   shouldn't break SAM).
+5. Manually re-render the README locally (or just inspect the diff) to
+   confirm the new API section is well-placed and the curl example
+   is copy-pasteable.

@@ -1,0 +1,201 @@
+import json
+from io import BytesIO
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from app import lambda_handler, run
+
+ACCOUNT = "123456789012"
+REGION = "eu-west-1"
+
+
+def _make_explorer_item(resource_id: str, service: str, tags: dict) -> dict:
+    """Build a Resource Explorer resource entry."""
+    return {
+        "Arn": f"arn:aws:{service}:{REGION}:{ACCOUNT}:resource/{resource_id}",
+        "Region": REGION,
+        "Properties": [
+            {
+                "Name": "tags",
+                "Data": [{"Key": k, "Value": v} for k, v in tags.items()],
+            }
+        ],
+    }
+
+
+def _make_session_with_resources(items, checkpoint_csv: bytes = b""):
+    """Build a mock boto3 Session for Resource Explorer and optionally S3."""
+    session = MagicMock()
+    explorer_client = MagicMock()
+    paginator = MagicMock()
+    paginator.paginate.return_value = [{"Resources": items}]
+    explorer_client.get_paginator.return_value = paginator
+
+    s3_client = MagicMock()
+    if checkpoint_csv:
+        s3_client.get_object.return_value = {"Body": BytesIO(checkpoint_csv)}
+    else:
+        from botocore.exceptions import ClientError
+        s3_client.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": ""}}, "GetObject"
+        )
+
+    def _client(service, **kwargs):
+        if service == "resource-explorer-2":
+            return explorer_client
+        return s3_client
+
+    session.client.side_effect = _client
+    return session
+
+
+@pytest.fixture
+def mock_env(monkeypatch):
+    monkeypatch.setenv("RequiredTags", "team,product")
+
+
+# ---------------------------------------------------------------------------
+# run() — core logic
+# ---------------------------------------------------------------------------
+
+@patch("app.boto3.Session")
+def test_run_returns_untagged_resources(mock_session_cls):
+    item = _make_explorer_item("my-func", "lambda", {"team": "de"})  # missing 'product'
+    item["Arn"] = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function/my-func"
+    mock_session_cls.return_value = _make_session_with_resources([item])
+
+    result = run(["team", "product"])
+
+    assert len(result.resources) == 1
+    assert result.resources[0].name == "my-func"
+
+
+@patch("app.boto3.Session")
+def test_run_returns_empty_when_filter_returns_nothing(mock_session_cls):
+    mock_session_cls.return_value = _make_session_with_resources([])
+
+    result = run(["team", "product"])
+
+    assert result.resources == []
+
+
+@patch("app.boto3.Session")
+def test_run_uses_profile_when_provided(mock_session_cls):
+    mock_session_cls.return_value = _make_session_with_resources([])
+
+    run(["team"], profile="my-profile")
+
+    mock_session_cls.assert_called_once_with(profile_name="my-profile")
+
+
+@patch("app.boto3.Session")
+def test_run_exclude_categories_filters_matching_resources(mock_session_cls):
+    item = _make_explorer_item("sagemaker-pipeline", "lambda", {})
+    item["Arn"] = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function/sagemaker-pipeline"
+    mock_session_cls.return_value = _make_session_with_resources([item])
+
+    result = run(["team"], exclude_categories=["data_science"])
+
+    assert result.resources == []
+    assert result.exclusion_counts["data_science"] == 1
+
+
+# ---------------------------------------------------------------------------
+# lambda_handler() — HTTP wrapper
+# ---------------------------------------------------------------------------
+
+@patch("app.boto3.Session")
+def test_lambda_handler_returns_json_response(mock_session_cls, mock_env):
+    item = _make_explorer_item("my-func", "lambda", {"team": "de"})
+    item["Arn"] = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function/my-func"
+    mock_session_cls.return_value = _make_session_with_resources([item])
+
+    response = lambda_handler({}, {})
+
+    assert response["statusCode"] == 200
+    assert response["headers"]["Content-Type"] == "application/json"
+    body = json.loads(response["body"])
+    assert body["total_resources"] == 1
+    assert body["by_resource_type"]["lambda:function"] == 1
+    assert "excluded_by_category" in body
+    assert body["resources"][0]["name"] == "my-func"
+
+
+@patch("app.boto3.Session")
+def test_lambda_handler_query_string_overrides_required_tags(mock_session_cls, mock_env):
+    item = _make_explorer_item("my-func", "lambda", {"team": "de"})
+    item["Arn"] = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function/my-func"
+    mock_session_cls.return_value = _make_session_with_resources([item])
+    event = {"queryStringParameters": {"required_tags": "team,owner"}}
+
+    response = lambda_handler(event, {})
+
+    body = json.loads(response["body"])
+    assert body["total_resources"] == 1
+
+
+@patch("app.boto3.Session")
+def test_lambda_handler_returns_500_on_error(mock_session_cls, mock_env):
+    mock_session_cls.side_effect = RuntimeError("boom")
+
+    response = lambda_handler({}, {})
+
+    assert response["statusCode"] == 500
+    assert "error" in json.loads(response["body"])
+
+
+# ---------------------------------------------------------------------------
+# run() — checkpointing
+# ---------------------------------------------------------------------------
+
+@patch("app.boto3.Session")
+def test_run_checkpoint_diff_is_none_without_path(mock_session_cls):
+    mock_session_cls.return_value = _make_session_with_resources([])
+
+    result = run(["team"])
+
+    assert result.diff is None
+
+
+@patch("app.boto3.Session")
+def test_run_checkpoint_diff_is_none_on_first_run(mock_session_cls):
+    # No existing checkpoint (NoSuchKey) → diff is None, checkpoint is saved
+    mock_session_cls.return_value = _make_session_with_resources([], checkpoint_csv=b"")
+
+    result = run(["team"], checkpoint_s3_path="s3://my-bucket/path")
+
+    assert result.diff is None  # first run — no previous data to diff
+
+
+@patch("app.boto3.Session")
+def test_run_checkpoint_diff_shows_added_and_removed(mock_session_cls):
+    # Previous checkpoint has func-old; current scan returns func-new
+    prev_csv = b"arn,name,resource_type,region\narn:aws:lambda:eu-west-1:123:function/func-old,func-old,lambda:function,eu-west-1\n"
+    item = _make_explorer_item("func-new", "lambda", {})
+    item["Arn"] = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function/func-new"
+    mock_session_cls.return_value = _make_session_with_resources([item], checkpoint_csv=prev_csv)
+
+    result = run(["team"], checkpoint_s3_path="s3://my-bucket/path")
+
+    assert result.diff is not None
+    assert len(result.diff.added) == 1
+    assert result.diff.added[0].name == "func-new"
+    assert len(result.diff.removed) == 1
+    assert result.diff.removed[0].name == "func-old"
+
+
+@patch("app.boto3.Session")
+def test_lambda_handler_diff_in_json_response(mock_session_cls, mock_env, monkeypatch):
+    monkeypatch.setenv("CheckpointS3Path", "s3://my-bucket/path")
+    prev_csv = b"arn,name,resource_type,region\narn:aws:lambda:eu-west-1:123:function/old-func,old-func,lambda:function,eu-west-1\n"
+    item = _make_explorer_item("new-func", "lambda", {})
+    item["Arn"] = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function/new-func"
+    mock_session_cls.return_value = _make_session_with_resources([item], checkpoint_csv=prev_csv)
+
+    response = lambda_handler({}, {})
+
+    body = json.loads(response["body"])
+    assert body["diff"] is not None
+    assert body["diff"]["added_count"] == 1
+    assert body["diff"]["removed_count"] == 1

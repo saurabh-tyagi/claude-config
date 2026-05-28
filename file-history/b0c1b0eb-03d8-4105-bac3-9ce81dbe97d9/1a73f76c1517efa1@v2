@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Right to Erasure Orchestrator.
+  Originally a replacement for the Tines Orchestrator, this stack primarily
+  consists of 2 AWS Lambdas that communicate with DynamoDB
+
+Parameters:
+  Environment:
+    Description: Environment
+    Type: String
+  DynamoDBTable:
+    Description: The DynamoDB table to create new RTE requests in
+    Type: String
+  DynamoDBTableGSI:
+    Description: The DynamoDB table GSI to query for RTE requests
+    Type: String
+
+Resources:
+  CreateApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'data-rte-orchestrator-create-api-${Environment}'
+      StageName: !Ref Environment
+      EndpointConfiguration:
+        Type: REGIONAL
+      TracingEnabled: true
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          Description: Usage plan for RTE Orchestrator Create API
+          Quota:
+            Limit: 10000
+            Period: DAY
+          Throttle:
+            RateLimit: 10
+            BurstLimit: 20
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          MetricsEnabled: true
+      Tags:
+        application: rte-orchestrator
+        vertical: data
+        owner: data
+        team: de
+        managed_by: aws-sam
+        product: right-to-erasure
+
+  ServerlessAccessManager:
+    Type: Custom::ServerlessAccessManager
+    Properties:
+      ServiceToken: !Sub "arn:aws:lambda:eu-west-1:${AWS::AccountId}:function:paas-serverless-access-manager"
+      FunctionName: !Sub 'data-rte-orchestrator-create-request-${Environment}'
+      VpcExecution: "true"
+      DatadogLogging: "true"
+      Targets:
+        DynamoDBTable:
+          Type: DynamoDB
+          Properties:
+            Table: !Ref DynamoDBTable
+
+  CreateFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !GetAtt ServerlessAccessManager.FunctionName
+      CodeUri: ./
+      Handler: dns_de_rte_orchestrator.creator_lambda.lambda_handler
+      Runtime: python3.13
+      Tracing: Active
+      Description: Create RTE requests
+      MemorySize: 256
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      VpcConfig: !GetAtt ServerlessAccessManager.VpcConfig
+      Role: !GetAtt ServerlessAccessManager.LambdaExecutionRoleArn
+      Environment:
+        Variables:
+          REPOSITORY_TYPE: "dynamodb"
+          DYNAMO_DB_TABLE: !Ref DynamoDBTable
+          DYNAMO_DB_INDEX: !Ref DynamoDBTableGSI
+          POWERTOOLS_SERVICE_NAME: !Sub "create-erasure-request-${Environment}"
+      Events:
+        CreateErasureRequest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CreateApi
+            Path: /erasure-request
+            Method: POST
+
+Outputs:
+  CreateApiUrl:
+    Description: Invoke URL for the Create Erasure Request endpoint
+    Value: !Sub "https://${CreateApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/erasure-request"
+  CreateApiId:
+    Description: API Gateway REST API ID for the Create API
+    Value: !Ref CreateApi

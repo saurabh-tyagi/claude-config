@@ -1,0 +1,304 @@
+from datetime import datetime, timedelta
+from typing import cast, override
+from unittest.mock import MagicMock
+
+import pytest
+from pytest import MonkeyPatch
+
+from dns_de_rte_orchestrator.as400 import NoOpAS400Notifier
+from dns_de_rte_orchestrator.audit_logging import AuditArchiver, NoOpAuditLogger
+from dns_de_rte_orchestrator.customer_api_client import (
+    CustomerAPIClient,
+    CustomerAPISiteID,
+    CustomerDetails,
+)
+from dns_de_rte_orchestrator.erasure_request import ErasureRequest, ErasureState
+from dns_de_rte_orchestrator.request_processor import (
+    MissingEmailAddress,
+    RequestProcessor,
+)
+from dns_de_rte_orchestrator.request_repository import InMemoryRequestRepository
+
+
+class StubCustomerAPI(CustomerAPIClient):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stored_details: dict[
+            tuple[str, CustomerAPISiteID | None], list[CustomerDetails]
+        ] = {}
+
+    @override
+    def get_customer_details(
+        self, email: str, site_id: CustomerAPISiteID | None = None
+    ) -> list[CustomerDetails]:
+        key = (email, site_id)
+        if key in self._stored_details:
+            return self._stored_details[key]
+        return []
+
+    def add_results_for(
+        self,
+        email: str,
+        site_id: CustomerAPISiteID | None,
+        results: list[CustomerDetails],
+    ) -> None:
+        if len(results) <= 0:
+            return
+        key = (email, site_id)
+        existing_list = self._stored_details.get(key)
+        if not existing_list:
+            existing_list = []
+        existing_list.extend(results)
+        self._stored_details[key] = existing_list
+
+
+def test_checking_timeout():
+    proc = RequestProcessor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+    )
+    assert not proc._check_timeout()  # pyright: ignore[reportPrivateUsage]
+    minutes_ago = datetime.now() - timedelta(minutes=10)
+    assert proc._check_timeout(minutes_ago)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_throws_for_missing_email_on_new():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="new",
+        date_issued=datetime.now(),
+        erasure_details={},
+        site_ids=[],
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+
+    proc = RequestProcessor(
+        repository=repo,
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+    )
+
+    with pytest.raises(MissingEmailAddress):
+        proc.process_new(request)
+
+
+def test_empty_enrichment():
+    proc = RequestProcessor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+    )
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="in-progress",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+    )
+    proc.enrich_request(request)
+
+
+def _make_archiver_mock() -> MagicMock:
+    return MagicMock(spec=AuditArchiver)
+
+
+def _build_processor(
+    archiver: AuditArchiver | None = None,
+    dry_run: bool = False,
+) -> tuple[RequestProcessor, InMemoryRequestRepository]:
+    repo = InMemoryRequestRepository()
+    proc = RequestProcessor(
+        repository=repo,
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        dry_run=dry_run,
+        archiver=archiver,
+    )
+    return proc, repo
+
+
+def _make_request(state: ErasureState = "new") -> ErasureRequest:
+    return ErasureRequest(
+        id="req-archive",
+        source="test",
+        state=state,
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+    )
+
+
+def test_enrichment_fails_for_missing_email():
+    proc = RequestProcessor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+    )
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="in-progress",
+        date_issued=datetime.now(),
+        erasure_details={},
+        site_ids=[],
+    )
+    with pytest.raises(MissingEmailAddress):
+        proc.enrich_request(request)
+
+
+def test_enrichment():
+    email: str = "example@foo.com"
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="in-progress",
+        date_issued=datetime.now(),
+        erasure_details={"email": email},
+        site_ids=[],
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+
+    customer_api = StubCustomerAPI()
+    first_name = "bob"
+    last_name = "martin"
+    loyalty = "loyal-12"
+    mobile = "077"
+    customer_api.add_results_for(
+        email,
+        10,
+        [
+            CustomerDetails(
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
+                site_id=10,
+                mobile_number=None,
+                loyalty_number=None,
+                och_id=None,
+                digital_identity_id=None,
+            ),
+        ],
+    )
+    customer_api.add_results_for(
+        email,
+        20,
+        [
+            CustomerDetails(
+                first_name="robert",  # should default to first found
+                last_name=None,
+                email=email,
+                site_id=20,
+                mobile_number=mobile,
+                loyalty_number=loyalty,
+                och_id=None,
+                digital_identity_id=None,
+            ),
+        ],
+    )
+
+    proc = RequestProcessor(
+        repository=repo,
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=customer_api,
+    )
+
+    proc.enrich_request(request)
+    enriched_details = request.erasure_details
+    assert enriched_details["first-name"] == first_name
+    assert enriched_details["last-name"] == last_name
+    assert enriched_details["phone-number"] == mobile
+    assert enriched_details["rfl"] == loyalty
+    assert request.site_ids == [10, 20]
+
+
+# --- Archiver integration via process() ---
+# Archival runs inside process() after a successful process_request call.
+# Tests use monkeypatch to make a phase handler transition to "done" so that
+# all assertions go through the real production call path.
+
+
+def _seed_done_via_phase1(monkeypatch: MonkeyPatch, proc: RequestProcessor) -> None:
+    """Patch process_phase1 to transition to "done" and seed repo with a phase-1 request."""
+
+    def _fake_phase1(request: ErasureRequest) -> None:
+        request.state = "done"
+        proc.repo.update(request)
+
+    monkeypatch.setattr(proc, "process_phase1", _fake_phase1)
+
+
+def test_archiver_called_when_request_reaches_done(monkeypatch: MonkeyPatch) -> None:
+    archiver_mock = _make_archiver_mock()
+    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
+    _seed_done_via_phase1(monkeypatch, proc)
+    request = _make_request(state="phase-1")
+    repo.create(request)
+
+    proc.process()
+
+    cast(MagicMock, archiver_mock.archive).assert_called_once_with("req-archive")
+
+
+def test_archiver_not_called_when_state_is_not_done(monkeypatch: MonkeyPatch) -> None:
+    archiver_mock = _make_archiver_mock()
+    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
+
+    # Patch process_phase1 to leave the request in phase-1 (not done) so archive must not fire
+    def _noop_phase1(_req: ErasureRequest) -> None:
+        pass
+
+    monkeypatch.setattr(proc, "process_phase1", _noop_phase1)
+    request = _make_request(state="phase-1")
+    repo.create(request)
+
+    proc.process()
+
+    cast(MagicMock, archiver_mock.archive).assert_not_called()
+
+
+def test_archiver_not_called_in_dry_run(monkeypatch: MonkeyPatch) -> None:
+    archiver_mock = _make_archiver_mock()
+    proc, repo = _build_processor(
+        archiver=cast(AuditArchiver, archiver_mock), dry_run=True
+    )
+    _seed_done_via_phase1(monkeypatch, proc)
+    request = _make_request(state="phase-1")
+    repo.create(request)
+
+    proc.process()
+
+    cast(MagicMock, archiver_mock.archive).assert_not_called()
+
+
+def test_archiver_exception_does_not_propagate(monkeypatch: MonkeyPatch) -> None:
+    archiver_mock = _make_archiver_mock()
+    cast(MagicMock, archiver_mock.archive).side_effect = RuntimeError("S3 down")
+    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
+    _seed_done_via_phase1(monkeypatch, proc)
+    request = _make_request(state="phase-1")
+    repo.create(request)
+
+    proc.process()  # should not raise even though archiver fails
+
+
+def test_process_request_without_archiver_does_not_raise(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    proc, repo = _build_processor(archiver=None)
+    _seed_done_via_phase1(monkeypatch, proc)
+    request = _make_request(state="phase-1")
+    repo.create(request)
+
+    proc.process()  # no archiver configured — must not raise

@@ -1,0 +1,264 @@
+import csv
+import io
+import json
+from io import BytesIO
+from unittest.mock import MagicMock, patch
+
+import pytest
+from botocore.exceptions import ClientError
+from botocore.stub import Stubber
+
+from checkpoint import diff_reports, load_checkpoint, parse_s3_path, save_checkpoint
+from models import CheckpointDiff, UntaggedResource
+
+BUCKET = "test-bucket"
+KEY = "path/to/checkpoint.csv"
+REGION = "eu-west-1"
+ACCOUNT = "123456789012"
+
+
+def _resource(name: str, service: str = "lambda") -> UntaggedResource:
+    return UntaggedResource(
+        arn=f"arn:aws:{service}:{REGION}:{ACCOUNT}:function/{name}",
+        resource_type=f"{service}:function",
+        region=REGION,
+        name=name,
+    )
+
+
+def _csv_bytes(resources):
+    lines = ["arn,name,resource_type,region"]
+    for r in resources:
+        lines.append(f"{r.arn},{r.name},{r.resource_type},{r.region}")
+    return "\n".join(lines).encode("utf-8")
+
+
+def _make_session(s3_mock):
+    session = MagicMock()
+    session.client.return_value = s3_mock
+    return session
+
+
+# ---------------------------------------------------------------------------
+# load_checkpoint
+# ---------------------------------------------------------------------------
+
+class TestLoadCheckpoint:
+    def test_returns_resources_from_csv(self):
+        r = _resource("my-func")
+        s3 = MagicMock()
+        s3.get_object.return_value = {"Body": BytesIO(_csv_bytes([r]))}
+        result = load_checkpoint(_make_session(s3), BUCKET, KEY)
+        assert len(result) == 1
+        assert result[0].arn == r.arn
+        assert result[0].name == r.name
+        assert result[0].resource_type == r.resource_type
+        assert result[0].region == r.region
+
+    def test_returns_none_when_key_not_found(self):
+        s3 = MagicMock()
+        error = ClientError({"Error": {"Code": "NoSuchKey", "Message": ""}}, "GetObject")
+        s3.get_object.side_effect = error
+        result = load_checkpoint(_make_session(s3), BUCKET, KEY)
+        assert result is None
+
+    def test_returns_none_for_404_code(self):
+        s3 = MagicMock()
+        error = ClientError({"Error": {"Code": "404", "Message": ""}}, "GetObject")
+        s3.get_object.side_effect = error
+        result = load_checkpoint(_make_session(s3), BUCKET, KEY)
+        assert result is None
+
+    def test_raises_other_client_errors(self):
+        s3 = MagicMock()
+        error = ClientError({"Error": {"Code": "AccessDenied", "Message": ""}}, "GetObject")
+        s3.get_object.side_effect = error
+        with pytest.raises(ClientError):
+            load_checkpoint(_make_session(s3), BUCKET, KEY)
+
+    def test_returns_empty_list_for_empty_csv(self):
+        s3 = MagicMock()
+        s3.get_object.return_value = {"Body": BytesIO(b"arn,name,resource_type,region\n")}
+        result = load_checkpoint(_make_session(s3), BUCKET, KEY)
+        assert result == []
+
+    def test_tags_round_trip_through_csv(self):
+        tags = {"team": "de", "product": "platform"}
+        r = UntaggedResource(
+            arn=f"arn:aws:lambda:{REGION}:{ACCOUNT}:function/my-func",
+            resource_type="lambda:function",
+            region=REGION,
+            name="my-func",
+            tags=tags,
+        )
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=["arn", "name", "resource_type", "region", "tags"])
+        writer.writeheader()
+        writer.writerow({
+            "arn": r.arn,
+            "name": r.name,
+            "resource_type": r.resource_type,
+            "region": r.region,
+            "tags": json.dumps(r.tags),
+        })
+        s3 = MagicMock()
+        s3.get_object.return_value = {"Body": BytesIO(buf.getvalue().encode("utf-8"))}
+        result = load_checkpoint(_make_session(s3), BUCKET, KEY)
+        assert result[0].tags == tags
+
+    def test_legacy_checkpoint_without_tags_column_loads_with_empty_dict(self):
+        csv_body = "arn,name,resource_type,region\n" \
+                   f"arn:aws:lambda:{REGION}:{ACCOUNT}:function/my-func,my-func,lambda:function,{REGION}\n"
+        s3 = MagicMock()
+        s3.get_object.return_value = {"Body": BytesIO(csv_body.encode("utf-8"))}
+        result = load_checkpoint(_make_session(s3), BUCKET, KEY)
+        assert result[0].tags == {}
+
+    def test_multiple_resources_parsed(self):
+        resources = [_resource("func-a"), _resource("func-b"), _resource("func-c")]
+        s3 = MagicMock()
+        s3.get_object.return_value = {"Body": BytesIO(_csv_bytes(resources))}
+        result = load_checkpoint(_make_session(s3), BUCKET, KEY)
+        assert len(result) == 3
+        assert {r.name for r in result} == {"func-a", "func-b", "func-c"}
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint
+# ---------------------------------------------------------------------------
+
+class TestSaveCheckpoint:
+    def test_calls_put_object_with_csv_content(self):
+        r = _resource("my-func")
+        s3 = MagicMock()
+        save_checkpoint(_make_session(s3), BUCKET, KEY, [r])
+        s3.put_object.assert_called_once()
+        call_kwargs = s3.put_object.call_args[1]
+        assert call_kwargs["Bucket"] == BUCKET
+        assert call_kwargs["Key"] == KEY
+        assert call_kwargs["ContentType"] == "text/csv"
+        body = call_kwargs["Body"].decode("utf-8")
+        assert r.arn in body
+        assert r.name in body
+
+    def test_csv_has_header_row(self):
+        s3 = MagicMock()
+        save_checkpoint(_make_session(s3), BUCKET, KEY, [])
+        body = s3.put_object.call_args[1]["Body"].decode("utf-8")
+        assert body.startswith("arn,name,resource_type,region,tags")
+
+    def test_saves_all_resources(self):
+        resources = [_resource("a"), _resource("b"), _resource("c")]
+        s3 = MagicMock()
+        save_checkpoint(_make_session(s3), BUCKET, KEY, resources)
+        body = s3.put_object.call_args[1]["Body"].decode("utf-8")
+        for r in resources:
+            assert r.arn in body
+
+    def test_empty_resource_list_saves_header_only(self):
+        s3 = MagicMock()
+        save_checkpoint(_make_session(s3), BUCKET, KEY, [])
+        body = s3.put_object.call_args[1]["Body"].decode("utf-8")
+        lines = [l for l in body.strip().splitlines() if l]
+        assert len(lines) == 1  # header only
+
+
+# ---------------------------------------------------------------------------
+# diff_reports
+# ---------------------------------------------------------------------------
+
+class TestDiffReports:
+    def test_all_new_when_previous_empty(self):
+        current = [_resource("func-a"), _resource("func-b")]
+        diff = diff_reports([], current)
+        assert len(diff.added) == 2
+        assert diff.removed == []
+
+    def test_all_removed_when_current_empty(self):
+        previous = [_resource("func-a"), _resource("func-b")]
+        diff = diff_reports(previous, [])
+        assert diff.added == []
+        assert len(diff.removed) == 2
+
+    def test_no_changes_when_identical(self):
+        resources = [_resource("func-a"), _resource("func-b")]
+        diff = diff_reports(resources, resources)
+        assert diff.added == []
+        assert diff.removed == []
+
+    def test_detects_single_addition(self):
+        previous = [_resource("func-a")]
+        current = [_resource("func-a"), _resource("func-b")]
+        diff = diff_reports(previous, current)
+        assert len(diff.added) == 1
+        assert diff.added[0].name == "func-b"
+        assert diff.removed == []
+
+    def test_detects_single_removal(self):
+        previous = [_resource("func-a"), _resource("func-b")]
+        current = [_resource("func-a")]
+        diff = diff_reports(previous, current)
+        assert diff.added == []
+        assert len(diff.removed) == 1
+        assert diff.removed[0].name == "func-b"
+
+    def test_detects_simultaneous_add_and_remove(self):
+        previous = [_resource("old-func")]
+        current = [_resource("new-func")]
+        diff = diff_reports(previous, current)
+        assert len(diff.added) == 1
+        assert diff.added[0].name == "new-func"
+        assert len(diff.removed) == 1
+        assert diff.removed[0].name == "old-func"
+
+    def test_diff_uses_arn_for_comparison(self):
+        # Same ARN — should not appear as added/removed even if name differs in object
+        r_prev = UntaggedResource(
+            arn=f"arn:aws:lambda:{REGION}:{ACCOUNT}:function/my-func",
+            resource_type="lambda:function", region=REGION, name="my-func",
+        )
+        r_curr = UntaggedResource(
+            arn=f"arn:aws:lambda:{REGION}:{ACCOUNT}:function/my-func",
+            resource_type="lambda:function", region=REGION, name="my-func-renamed",
+        )
+        diff = diff_reports([r_prev], [r_curr])
+        assert diff.added == []
+        assert diff.removed == []
+
+    def test_returns_checkpoint_diff_type(self):
+        diff = diff_reports([], [])
+        assert isinstance(diff, CheckpointDiff)
+
+
+# ---------------------------------------------------------------------------
+# parse_s3_path
+# ---------------------------------------------------------------------------
+
+class TestParseS3Path:
+    def test_basic_path_with_prefix(self):
+        bucket, key = parse_s3_path("s3://my-bucket/dns/untagged-reporter/dev")
+        assert bucket == "my-bucket"
+        assert key == "dns/untagged-reporter/dev/checkpoint.csv"
+
+    def test_trailing_slash_is_stripped(self):
+        bucket, key = parse_s3_path("s3://my-bucket/dns/untagged-reporter/dev/")
+        assert bucket == "my-bucket"
+        assert key == "dns/untagged-reporter/dev/checkpoint.csv"
+
+    def test_bucket_only_no_prefix(self):
+        bucket, key = parse_s3_path("s3://my-bucket")
+        assert bucket == "my-bucket"
+        assert key == "checkpoint.csv"
+
+    def test_bucket_with_trailing_slash_only(self):
+        bucket, key = parse_s3_path("s3://my-bucket/")
+        assert bucket == "my-bucket"
+        assert key == "checkpoint.csv"
+
+    def test_invalid_scheme_raises_value_error(self):
+        with pytest.raises(ValueError, match="Invalid S3 path"):
+            parse_s3_path("https://my-bucket/path")
+
+    def test_no_scheme_raises_value_error(self):
+        with pytest.raises(ValueError, match="Invalid S3 path"):
+            parse_s3_path("my-bucket/path")

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Datalake CI Permissions"
+  short_description: "Add or update datalake AWS resource and GitLab CI IAM roles"
+  default_prompt: "Use $datalake-ci-permissions to update datalake GitLab CI IAM and matching infrastructure changes for a AWS datalake account related resource."

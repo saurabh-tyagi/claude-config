@@ -1,0 +1,95 @@
+# Plan: Address MR !49 Review Comments
+
+## Context
+MR !49 (DAS-4125) adds a private API Gateway in front of the RTE Creator Lambda. Reviewer LyndonHB left 5 inline comments requesting clarifications, a softer GDPR-comment tone, proper auth on the API, and context for hardcoded values. This plan addresses each comment with minimal, targeted changes.
+
+---
+
+## Change 1 — `tests/conftest.py:5` (reviewer wants a fixture, not module-level env set)
+
+**Decision**: Keep the module-level `setdefault` — a fixture cannot work here because `creator_lambda.py:26` calls `get_request_repository()` at **module import time**, which runs before any fixture (including session-scoped) executes. Instead, replace the current comment with one that explains this constraint clearly so future readers don't try to "fix" it again.
+
+**File**: `tests/conftest.py`
+```python
+import os
+
+# Must be set BEFORE any test module imports `creator_lambda`, because
+# that module calls get_request_repository() at import time. A pytest
+# fixture would run too late — by then the DynamoDB repository is
+# already instantiated. This is the reason conftest.py exists at all.
+_ = os.environ.setdefault("REPOSITORY_TYPE", "memory")
+```
+
+---
+
+## Change 2 — `template.yaml:81-83` (soften "GDPR violation" language)
+
+Reviewer's point: logging an erasure request is bad practice but is not strictly a GDPR fine-able event. Reword to stay accurate.
+
+**File**: `template.yaml`
+```yaml
+# POWERTOOLS_LOGGER_LOG_EVENT must NOT be set — the incoming event
+# contains erasure_details (PII: email, name, postcode). Logging this
+# would retain personal data in CloudWatch and should be avoided.
+```
+
+---
+
+## Change 3 — `template.yaml:46-57` (add API key auth as requested)
+
+Reviewer's point: OneTrust should present a token. User chose API key auth.
+
+**File**: `template.yaml`
+
+1. Set `ApiKeyRequired: true` in `CreateRequestApi.Auth`
+2. Add three new resources under `Resources`:
+   - `CreateRequestApiKey` (`AWS::ApiGateway::ApiKey`)
+   - `CreateRequestUsagePlan` (`AWS::ApiGateway::UsagePlan`) — references `CreateRequestApi` stage
+   - `CreateRequestUsagePlanKey` (`AWS::ApiGateway::UsagePlanKey`) — links key to plan
+3. Add `CreateRequestApiKeyId` to `Outputs` so operators can fetch the key value from the console
+
+The `CreateErasureRequest` event on `CreateFunction` also needs `Auth.ApiKeyRequired: true` to enforce the key per-method.
+
+---
+
+## Change 4 — `samconfig.toml:31,56` (explain hardcoded VPCE ID)
+
+Reviewer's point: why is the VPCE ID hardcoded and identical across envs?
+
+**File**: `samconfig.toml` — add a header comment in both `[dev.deploy.parameters]` and `[prod.deploy.parameters]` blocks:
+
+```toml
+# VPCEndpointId references the single execute-api VPCE
+# (vpce-0ccf7efad71b28b54) in the eu-west-1 account. Both dev and
+# prod share it because only one execute-api VPCE exists in the account.
+VPCEndpointId=vpce-0ccf7efad71b28b54
+```
+
+---
+
+## Change 5 — `creator_lambda.py:34` (justify the 512 field-length cap)
+
+Reviewer's point: is 512 arbitrary? Could real data exceed it?
+
+**File**: `src/dns_de_rte_orchestrator/creator_lambda.py`
+```python
+# 512 chars is a safe upper bound for all expected fields:
+# RFC 5321 caps email addresses at 254, and postcodes/names
+# are far shorter in practice.
+_MAX_FIELD_LEN = 512
+```
+
+---
+
+## Files to Modify
+- `tests/conftest.py`
+- `template.yaml`
+- `samconfig.toml`
+- `src/dns_de_rte_orchestrator/creator_lambda.py`
+
+## Verification
+1. `uv run pytest` — all 13 existing tests still pass (no functional changes to request handling)
+2. `uv run prek` — black, ruff, basedpyright all green
+3. `sam validate --lint` — CloudFormation validates with the new API key resources
+4. `sam build` — build succeeds
+5. Reply to each MR thread on GitLab explaining the change or rationale, then resolve the thread

@@ -1,0 +1,5 @@
+import os
+
+# Use in-memory repository during tests so module-level imports in lambdas
+# don't attempt DynamoDB connections or require AWS env vars.
+os.environ.setdefault("REPOSITORY_TYPE", "memory")

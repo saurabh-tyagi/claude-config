@@ -1,0 +1,73 @@
+# Plan: Extend exclusion list with additional low/medium cost types
+
+## Context
+A real scan against dev (50 distinct resource types) revealed the current exclusion list is too narrow — free/config-only types are still showing up as noise and drowning out actionable findings. Most egregious: `batch:job-definition` has 44,333 rows, all of which are versioned config objects with zero cost. Purpose of this change: prune the reported list down to types that actually drive cost, so the report becomes useful for tagging compliance.
+
+## Scope
+Single file change in `lambda/untagged-reporter/src/scanner.py` — extend `_DEFAULT_EXCLUDED_RESOURCE_TYPES` (currently ~55 entries) with the additional types below. No behaviour change beyond the expanded set; the post-filter code path in `_run_query` already supports this.
+
+## Types to add to the exclusion list
+
+Grouped by reason, with the dev scan counts in parentheses to motivate each addition:
+
+### Config objects (free — zero cost impact)
+- `batch:job-definition` (44,333) — versioned task definitions, noise
+- `batch:job-queue` (1) — routing config
+- `ec2:launch-template` (12) — config, real cost lives on launched instances
+- `apprunner:autoscalingconfiguration` (1)
+- `databrew:recipe` (3)
+- `elasticache:subnetgroup` (1)
+- `elasticache:user` (1)
+- `memorydb:acl` (1)
+- `memorydb:parametergroup` (6)
+- `memorydb:user` (1)
+- `rds:secgrp` (1) — legacy RDS security group
+- `resiliencehub:resiliency-policy` (1)
+- `scheduler:schedule-group` (1) — billed per invocation, not per group
+
+### Free/negligible primitives
+- `backup:backup-plan` (13) — plan config; `backup:backup-vault` stays (storage cost)
+- `ec2:vpc-peering-connection` (7) — peering is free, data transfer billed via instances
+- `events:event-bus` (1) — billed per matched event
+- `guardduty:detector` (1) — billed per finding/GB analysed
+- `kms:key` (28) — $1/key/month is fixed, unaffected by tagging
+- `resource-groups:group` (23) — free metadata
+- `schemas:discoverer` (3) — ~$0.10/month each, negligible
+- `transfer:user` (5) — free; the `transfer:server` stays (~$216/month each)
+
+### Load balancer sub-resources (the `/app` variant)
+Resource Explorer returns these with an `/app` suffix that the current exclusion entries don't match:
+- `elasticloadbalancing:listener/app` (21)
+- `elasticloadbalancing:listener-rule/app` (26)
+
+These need to be added *in addition to* the existing bare `elasticloadbalancing:listener` / `listener-rule` entries (they stay — different ARN shapes for NLB/GWLB).
+
+### cloudtrail:dashboard
+- `cloudtrail:dashboard` (15) — free metadata view over event data store
+
+## Types that stay visible (real cost)
+Confirmed kept for reference — do NOT add these to the exclusion list:
+- `apigateway:apis`, `apigateway:restapis`, stages — $3.50/M REST calls, WebSocket minutes, data transfer
+- `backup:backup-vault` — actual backup storage cost
+- `batch:compute-environment` — provisions EC2/Fargate
+- `cloudtrail:eventdatastore` — $2.50/100M events + storage
+- `ec2:natgateway` — $0.045/hr + $0.045/GB processed
+- `ec2:transit-gateway-attachment` — ~$36/month per attachment
+- `elasticloadbalancing:loadbalancer/app` — hourly + LCU charges
+- `states:stateMachine` — $0.025/1k transitions
+- `transfer:server` — ~$216/month each
+- `ecr:repository` (37), `secretsmanager:secret` (25) — already visible, meaningful cost at scale
+
+## File to modify
+`/Users/saurabhtyagi/Documents/workspace/dns-de-automation/lambda/untagged-reporter/src/scanner.py` — extend the `_DEFAULT_EXCLUDED_RESOURCE_TYPES` frozenset starting at line 58. Keep the existing grouping comments and add matching comments for each new cluster.
+
+## Tests
+No test changes required:
+- The exclusion-filter behaviour is already covered by `test_excluded_resource_type_is_dropped`, `test_unknown_new_service_type_passes_through`, and `test_custom_excluded_types_override_default` in `test/test_scanner.py`.
+- The specific set of default exclusions is data, not logic — asserting individual entries would be churn with no value.
+- Run `python3 -m pytest test/` to confirm 107 tests still pass after the edit.
+
+## Verification
+1. Run tests: `python3 -m pytest test/` — expect 107 passed
+2. Deploy to dev: `aws-vault exec de -- sam deploy --config-env datalake`
+3. Invoke the Lambda and compare the `by_resource_type` output to the previous scan — the listed types above should no longer appear, leaving only the cost-relevant types.

@@ -1,0 +1,190 @@
+from datetime import datetime, timedelta
+from typing import override
+
+import pytest
+
+from dns_de_rte_orchestrator.as400 import NoOpAS400Notifier
+from dns_de_rte_orchestrator.audit_logging import NoOpAuditLogger
+from dns_de_rte_orchestrator.customer_api_client import (
+    CustomerAPIClient,
+    CustomerAPISiteID,
+    CustomerDetails,
+)
+from dns_de_rte_orchestrator.erasure_request import ErasureRequest
+from dns_de_rte_orchestrator.request_processor import (
+    MissingEmailAddress,
+    RequestProcessor,
+)
+from dns_de_rte_orchestrator.request_repository import InMemoryRequestRepository
+
+
+class StubCustomerAPI(CustomerAPIClient):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stored_details: dict[
+            tuple[str, CustomerAPISiteID | None], list[CustomerDetails]
+        ] = {}
+
+    @override
+    def get_customer_details(
+        self, email: str, site_id: CustomerAPISiteID | None = None
+    ) -> list[CustomerDetails]:
+        key = (email, site_id)
+        if key in self._stored_details:
+            return self._stored_details[key]
+        return []
+
+    def add_results_for(
+        self,
+        email: str,
+        site_id: CustomerAPISiteID | None,
+        results: list[CustomerDetails],
+    ) -> None:
+        if len(results) <= 0:
+            return
+        key = (email, site_id)
+        existing_list = self._stored_details.get(key)
+        if not existing_list:
+            existing_list = []
+        existing_list.extend(results)
+        self._stored_details[key] = existing_list
+
+
+def test_checking_timeout():
+    proc = RequestProcessor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+    )
+    assert not proc._check_timeout()  # pyright: ignore[reportPrivateUsage]
+    minutes_ago = datetime.now() - timedelta(minutes=10)
+    assert proc._check_timeout(minutes_ago)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_throws_for_missing_email_on_new():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="new",
+        date_issued=datetime.now(),
+        erasure_details={},
+        site_ids=[],
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+
+    proc = RequestProcessor(
+        repository=repo,
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+    )
+
+    with pytest.raises(MissingEmailAddress):
+        proc.process_new(request)
+
+
+def test_empty_enrichment():
+    proc = RequestProcessor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+    )
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="in-progress",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+    )
+    proc.enrich_request(request)
+
+
+def test_enrichment_fails_for_missing_email():
+    proc = RequestProcessor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+    )
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="in-progress",
+        date_issued=datetime.now(),
+        erasure_details={},
+        site_ids=[],
+    )
+    with pytest.raises(MissingEmailAddress):
+        proc.enrich_request(request)
+
+
+def test_enrichment():
+    email: str = "example@foo.com"
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="in-progress",
+        date_issued=datetime.now(),
+        erasure_details={"email": email},
+        site_ids=[],
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+
+    customer_api = StubCustomerAPI()
+    first_name = "bob"
+    last_name = "martin"
+    loyalty = "loyal-12"
+    mobile = "077"
+    customer_api.add_results_for(
+        email,
+        10,
+        [
+            CustomerDetails(
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
+                site_id=10,
+                mobile_number=None,
+                loyalty_number=None,
+                och_id=None,
+                digital_identity_id=None,
+            ),
+        ],
+    )
+    customer_api.add_results_for(
+        email,
+        20,
+        [
+            CustomerDetails(
+                first_name="robert",  # should default to first found
+                last_name=None,
+                email=email,
+                site_id=20,
+                mobile_number=mobile,
+                loyalty_number=loyalty,
+                och_id=None,
+                digital_identity_id=None,
+            ),
+        ],
+    )
+
+    proc = RequestProcessor(
+        repository=repo,
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=customer_api,
+    )
+
+    proc.enrich_request(request)
+    enriched_details = request.erasure_details
+    assert enriched_details["first-name"] == first_name
+    assert enriched_details["last-name"] == last_name
+    assert enriched_details["phone-number"] == mobile
+    assert enriched_details["rfl"] == loyalty
+    assert request.site_ids == [10, 20]

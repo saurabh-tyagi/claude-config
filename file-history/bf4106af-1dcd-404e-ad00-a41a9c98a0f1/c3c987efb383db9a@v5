@@ -1,0 +1,68 @@
+# Return 409 Conflict for duplicate erasure request IDs
+
+## Context
+
+The `creator_lambda` `lambda_handler` catches all exceptions from `request_repo.create()` with a broad `except Exception:` and returns HTTP 500. When DynamoDB's `ConditionExpression = attribute_not_exists(id)` fires on a duplicate id it raises `ClientError` with code `ConditionalCheckFailedException` — but this is currently indistinguishable from any other failure, so callers receive a misleading 500 instead of a 409 Conflict.
+
+The fix is to detect `ConditionalCheckFailedException` before the generic handler and return 409, leaving all other exceptions to continue returning 500.
+
+## Approach
+
+### 1. `src/dns_de_rte_orchestrator/creator_lambda.py`
+
+Add a specific `except ClientError` branch **before** the broad `except Exception:` that:
+- Checks `e.response["Error"]["Code"] == "ConditionalCheckFailedException"`
+- If so, logs a warning and returns `_response(409, {"error": "conflict", "id": request.id})`
+- If not (some other `ClientError` — e.g. provisioned throughput, table not found), re-raises so the outer broad handler catches it and returns 500
+
+`ClientError` is already available via `botocore.exceptions` — add the import.
+
+The modified `try` block in `lambda_handler`:
+
+```python
+from botocore.exceptions import ClientError
+
+try:
+    if in_dry_run_mode:
+        logger.warning("DryRun: Would have created request for %s", request.id)
+    else:
+        request_repo.create(request)
+except ClientError as e:
+    if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+        logger.warning("Duplicate erasure request rejected: %s", request.id)
+        return _response(409, {"error": "conflict", "id": request.id})
+    logger.exception("Failed to create erasure request %s", str(request))
+    return _response(500, {"error": "internal error"})
+except Exception:
+    logger.exception("Failed to create erasure request %s", str(request))
+    return _response(500, {"error": "internal error"})
+```
+
+### 2. `tests/test_creator_lambda.py`
+
+Add one test:
+- Stub `mock_repo.create` with `side_effect = ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": ""}}, "PutItem")`
+- Assert response is 409 with `{"error": "conflict", "id": "req-123"}`
+
+Reuse the existing `make_proxy_event` / `make_body` / `monkeypatch` patterns already in the file.
+
+### 3. `InMemoryRequestRepository` (optional consistency)
+
+`create` already raises `ValueError(f"{request.id} already exists")` for duplicates in the in-memory implementation (`request_repository.py:91`). This is not a `ClientError` so the new `except ClientError` branch won't catch it — in-memory duplicates will still return 500. This is acceptable since `InMemoryRequestRepository` is only used in tests and dev; it is not deployed. No change needed.
+
+## Critical files
+
+- `src/dns_de_rte_orchestrator/creator_lambda.py` — add `ClientError` import, new `except` branch
+- `tests/test_creator_lambda.py` — one new test for the 409 path
+
+## Reuse
+
+- `_response(int, dict)` helper at `creator_lambda.py:120` — already used for all other responses
+- `make_proxy_event` / `make_body` fixtures in `tests/test_creator_lambda.py`
+- `botocore.exceptions.ClientError` (already used in `audit_logging.py` and test files)
+
+## Verification
+
+1. `uv run pytest tests/test_creator_lambda.py -v` — new 409 test passes; existing 200/400/500 tests unaffected.
+2. `uv run basedpyright` — 0 errors, 0 warnings.
+3. `uv run pytest` — full suite green.

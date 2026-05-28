@@ -1,0 +1,9 @@
+{
+  "UntaggedReporterFunction": {
+    "RequiredTags": "team,product",
+    "Region": "eu-west-1",
+    "Env": "dev",
+    "CheckpointS3Path": "",
+    "ExcludeCategories": ""
+  }
+}

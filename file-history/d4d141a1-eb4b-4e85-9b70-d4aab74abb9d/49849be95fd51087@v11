@@ -1,0 +1,316 @@
+import logging
+from typing import AbstractSet, Dict, List, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
+from models import UntaggedResource
+
+logger = logging.getLogger(__name__)
+
+# Scans eu-west-1 only. Requires an AWS Resource Explorer Aggregator index in this region.
+_REGION = "eu-west-1"
+
+# Human-readable display labels for known resource types (used by the reporter).
+# New AWS service types not listed here are still reported — label falls back to the
+# raw resource type string.
+RESOURCE_TYPE_LABELS = {
+    # Compute
+    "ec2:instance": "ec2_instance",
+    "lambda:function": "lambda_function",
+    "ecs:cluster": "ecs_cluster",
+    "ecs:service": "ecs_service",
+    # Block / object storage
+    "ec2:volume": "ebs_volume",
+    "ec2:snapshot": "ebs_snapshot",
+    "s3:bucket": "s3_bucket",
+    # Managed databases
+    "rds:db": "rds_instance",
+    "rds:cluster": "rds_cluster",
+    "dynamodb:table": "dynamodb_table",
+    "redshift:cluster": "redshift_cluster",
+    # Analytics / streaming
+    "elasticmapreduce:cluster": "emr_cluster",
+    "athena:workgroup": "athena_workgroup",
+    "glue:job": "glue_job",
+    "glue:crawler": "glue_crawler",
+    "kinesis:stream": "kinesis_stream",
+    "firehose:deliverystream": "kinesis_firehose",
+    # In-memory / search / messaging
+    "elasticache:cluster": "elasticache_cluster",
+    "elasticache:replication-group": "elasticache_replication_group",
+    "kafka:cluster": "msk_cluster",
+    "es:domain": "opensearch_domain",
+    # CI/CD and container registry
+    "ecr:repository": "ecr_repository",
+    "codebuild:project": "codebuild_project",
+    "codepipeline:pipeline": "codepipeline",
+    "stepfunctions:stateMachine": "step_functions_state_machine",
+    # Security / secrets
+    "secretsmanager:secret": "secrets_manager_secret",
+    # Messaging
+    "sqs:queue": "sqs_queue",
+    "sns:topic": "sns_topic",
+}
+
+# Reverse map: lowercase friendly label -> type key (e.g. "ec2_instance" -> "ec2:instance")
+LABEL_TO_RESOURCE_TYPE: Dict[str, str] = {v.lower(): k for k, v in RESOURCE_TYPE_LABELS.items()}
+
+# Resource types dropped from scan results client-side. These are free or near-free
+# AWS primitives that don't meaningfully contribute to cloud spend and add noise.
+# New service types not listed here pass through automatically.
+_DEFAULT_EXCLUDED_RESOURCE_TYPES: frozenset = frozenset({
+    # VPC plumbing — free constructs, no per-hour charge
+    "ec2:vpc",
+    "ec2:subnet",
+    "ec2:route-table",
+    "ec2:network-acl",
+    "ec2:internet-gateway",
+    "ec2:network-interface",
+    "ec2:security-group",
+    "ec2:security-group-rule",
+    "ec2:key-pair",
+    "ec2:vpc-endpoint",
+    "ec2:elastic-ip",           # ~$0.005/hr only when unattached; not a tagging priority
+    # IAM — always free
+    "iam:role",
+    "iam:policy",
+    "iam:user",
+    "iam:group",
+    "iam:instance-profile",
+    "iam:oidc-provider",
+    "iam:saml-provider",
+    # CloudFormation — free metadata
+    "cloudformation:stack",
+    "cloudformation:stackset",
+    # Observability / governance — per-metric or per-event costs, not per-resource
+    "cloudtrail:trail",
+    "cloudwatch:alarm",
+    "cloudwatch:dashboard",
+    "logs:log-group",
+    "config:config-rule",
+    "access-analyzer:analyzer",
+    "ram:resource-share",
+    # SSM — parameters and documents are free; instances billed via EC2
+    "ssm:parameter",
+    "ssm:document",
+    "ssm:association",
+    "ssm:managed-instance",
+    # EventBridge — billed per matched event, not per rule
+    "events:rule",
+    # Glue catalog-only types — no compute, just metadata
+    "glue:database",
+    "glue:table",
+    "glue:registry",
+    "glue:workflow",
+    "glue:trigger",
+    # Athena catalog — free metadata pointer to Glue Data Catalog
+    "athena:datacatalog",
+    # RDS parameter/option groups — free configuration objects
+    "rds:pg",
+    "rds:cluster-pg",
+    "rds:og",
+    "rds:subgrp",
+    "rds:auto-backup",
+    "rds:cluster-snapshot",
+    # ECS / Lambda configuration objects — billed via underlying compute
+    "ecs:task-definition",
+    "lambda:event-source-mapping",
+    # ACM certificates — free
+    "acm:certificate",
+    # Load balancer sub-resources — billed via the LB itself
+    # Both bare and /app-suffixed variants are returned by Resource Explorer
+    "elasticloadbalancing:listener",
+    "elasticloadbalancing:listener/app",
+    "elasticloadbalancing:listener-rule",
+    "elasticloadbalancing:listener-rule/app",
+    "elasticloadbalancing:targetgroup",
+    # EC2 config / free network constructs
+    "ec2:launch-template",           # config; real cost is on launched instances
+    "ec2:vpc-peering-connection",    # peering is free; data transfer billed via instances
+    # Batch config objects — billed via underlying compute, not the config resources
+    "batch:job-definition",          # versioned config (44k+ entries possible), zero cost
+    "batch:job-queue",
+    # EventBridge / Scheduler — billed per event/invocation, not per resource
+    "events:event-bus",
+    "scheduler:schedule-group",
+    # Backup — plan config is free; vault (storage) stays visible
+    "backup:backup-plan",
+    # ElastiCache / MemoryDB config objects — free, cluster resources stay visible
+    "elasticache:subnetgroup",
+    "elasticache:user",
+    "memorydb:acl",
+    "memorydb:parametergroup",
+    "memorydb:user",
+    # RDS misc config
+    "rds:secgrp",                    # legacy RDS security group, free
+    # AppRunner / DataBrew / Resiliencehub config — free metadata
+    "apprunner:autoscalingconfiguration",
+    "databrew:recipe",
+    "resiliencehub:resiliency-policy",
+    # AWS Transfer — users are free; the server resource stays visible
+    "transfer:user",
+    # Governance / security primitives — cost is per-event or per-finding, not per resource
+    "cloudtrail:dashboard",          # free metadata view over event data store
+    "guardduty:detector",            # billed per finding/GB analysed, not per detector
+    "kms:key",                       # $1/key/month regardless of tagging
+    "resource-groups:group",         # free metadata
+    "schemas:discoverer",            # ~$0.10/month, negligible
+})
+
+
+def _extract_resource_name(arn: str) -> str:
+    """Extract a human-readable name from an ARN."""
+    parts = arn.split(":")
+    if len(parts) < 6:
+        return arn
+    resource_part = ":".join(parts[5:])
+    # arn:aws:service:region:account:type/name       -> name (or team/name for nested paths)
+    # arn:aws:ecr:...:repository/team/app            -> team/app (full path, not just last segment)
+    if "/" in resource_part:
+        return resource_part.split("/", 1)[1]
+    # arn:aws:secretsmanager:...:secret:my-secret    -> my-secret (strip type prefix)
+    # arn:aws:rds:...:db:my-database                 -> my-database
+    if ":" in resource_part:
+        return resource_part.split(":", 1)[1]
+    # arn:aws:sqs:...:my-queue  or  arn:aws:s3:::my-bucket  -> my-queue / my-bucket
+    return resource_part
+
+
+# Services whose ARNs carry a bare resource name with no type prefix in parts[5].
+# Example: arn:aws:sqs:eu-west-1:123456789012:my-queue  (parts[5] = "my-queue")
+_BARE_RESOURCE_SERVICES = {"sqs": "sqs:queue", "sns": "sns:topic"}
+
+
+def _extract_resource_type(arn: str) -> str:
+    """Extract a normalised resource type string from an ARN.
+
+    Format: service[:subtype]  e.g. 'ec2:instance', 's3:bucket', 'glue:job'
+
+    Handles three ARN shapes:
+      - S3:                                  arn:aws:s3:::bucket → "s3:bucket"
+      - Bare name (SQS, SNS):                arn:aws:sqs:r:a:queue → "sqs:queue"
+      - Standard  (type/name or type:name):  arn:aws:ec2:r:a:instance/id → "ec2:instance"
+    """
+    parts = arn.split(":")
+    if len(parts) < 3:
+        return "unknown"
+    service = parts[2]
+    # S3 is the only service with the ARN shape arn:aws:s3:::bucket
+    if service == "s3":
+        return "s3:bucket"
+    # Services where parts[5] is a bare resource name, not a type prefix
+    if service in _BARE_RESOURCE_SERVICES:
+        return _BARE_RESOURCE_SERVICES[service]
+    # Standard: parts[5] is "type/name", "type:name", or just "type"
+    if len(parts) > 5 and parts[5]:
+        sub = parts[5].split("/", 1)[0].split(":", 1)[0]
+        return f"{service}:{sub}"
+    return service
+
+
+def _build_filter_string(required_tag: Optional[str]) -> str:
+    """Build a Resource Explorer FilterString for a single tag key.
+
+    Uses `resourcetype.supports:tags` to restrict to taggable resources server-side.
+    Resource Explorer ANDs all space-separated terms, so multiple `resourcetype:` terms
+    in one FilterString would match nothing (a resource can only have one type).
+    Type filtering is therefore applied client-side in _run_query.
+
+    scan_untagged_resources runs one query per required tag and unions results,
+    giving all resources missing at least one required tag.
+    """
+    parts = [f"-tag.key:{required_tag}"] if required_tag else []
+    parts.append("resourcetype.supports:tags")
+    parts.append(f"region:{_REGION}")
+    return " ".join(parts)
+
+
+def _run_query(
+    client,
+    filter_string: str,
+    excluded_resource_types: AbstractSet[str],
+) -> Dict[str, UntaggedResource]:
+    """Execute a single Resource Explorer list_resources query.
+
+    Returns a dict of ARN -> UntaggedResource, dropping types in excluded_resource_types.
+    """
+    results: Dict[str, UntaggedResource] = {}
+    paginator = client.get_paginator("list_resources")
+    for page in paginator.paginate(Filters={"FilterString": filter_string}):
+        for resource in page.get("Resources", []):
+            arn = resource["Arn"]
+            resource_type = resource.get("ResourceType") or _extract_resource_type(arn)
+            if resource_type in excluded_resource_types:
+                continue
+
+            region = resource.get("Region", "")
+            tags = {}
+            for prop in resource.get("Properties", []):
+                if prop.get("Name") == "tags":
+                    try:
+                        tags = {
+                            t["Key"]: t["Value"]
+                            for t in (prop.get("Data") or [])
+                        }
+                    except (TypeError, KeyError):
+                        pass
+
+            results[arn] = UntaggedResource(
+                arn=arn,
+                resource_type=resource_type,
+                region=region,
+                name=_extract_resource_name(arn),
+                tags=tags,
+            )
+    return results
+
+
+def scan_untagged_resources(
+    session: boto3.Session,
+    required_tags: Optional[List[str]] = None,
+    excluded_resource_types: AbstractSet[str] = _DEFAULT_EXCLUDED_RESOURCE_TYPES,
+) -> List[UntaggedResource]:
+    """Scan eu-west-1 for resources missing required tags using AWS Resource Explorer.
+
+    Runs one list_resources query per required tag and unions results by ARN.
+    This ensures resources missing at least one required tag are returned, even
+    if they have some of the other required tags. Type filtering is applied
+    client-side after the API call (Resource Explorer ANDs all FilterString terms,
+    so multiple resourcetype: terms would match nothing).
+
+    New AWS service types not in excluded_resource_types pass through automatically,
+    so the scanner adapts as AWS introduces new taggable resource types.
+
+    Args:
+        session: boto3 Session (credentials / profile already configured).
+        required_tags: Tag keys every resource must have. Resources missing at
+            least one of these are returned. If empty or None, all non-excluded
+            taggable resources are returned.
+        excluded_resource_types: Resource types to drop. Defaults to
+            _DEFAULT_EXCLUDED_RESOURCE_TYPES (free/near-free AWS primitives).
+
+    Returns:
+        List of UntaggedResource objects (deduplicated by ARN, sorted by type and name).
+    """
+    tags_to_query: List[Optional[str]] = list(required_tags) if required_tags else [None]
+    merged: Dict[str, UntaggedResource] = {}
+
+    try:
+        client = session.client("resource-explorer-2", region_name=_REGION)
+        for tag in tags_to_query:
+            filter_string = _build_filter_string(tag)
+            logger.info("Resource Explorer filter (tag=%s): %s", tag, filter_string)
+            merged.update(_run_query(client, filter_string, excluded_resource_types))
+
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        logger.error("Resource Explorer scan failed — %s: %s", code, exc)
+        raise
+    except Exception as exc:
+        logger.error("Resource Explorer scan failed — unexpected error: %s", exc)
+        raise
+
+    untagged = sorted(merged.values(), key=lambda r: (r.resource_type, r.name))
+    logger.info("Total resources found: %d", len(untagged))
+    return untagged

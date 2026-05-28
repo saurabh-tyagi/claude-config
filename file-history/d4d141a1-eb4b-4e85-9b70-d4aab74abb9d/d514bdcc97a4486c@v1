@@ -1,0 +1,36 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+
+@dataclass
+class CheckpointDiff:
+    added: List[UntaggedResource]    # new untagged resources since last run
+    removed: List[UntaggedResource]  # resources no longer untagged since last run
+
+
+@dataclass
+class ScanResult:
+    resources: List[UntaggedResource]
+    exclusion_counts: Dict[str, int] = field(default_factory=dict)
+    diff: Optional[CheckpointDiff] = None
+
+
+@dataclass
+class UntaggedResource:
+    arn: str
+    resource_type: str
+    region: str
+    name: str
+    tags: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def service(self) -> str:
+        parts = self.arn.split(":")
+        return parts[2] if len(parts) > 2 else "unknown"
+
+    @property
+    def account_id(self) -> str:
+        parts = self.arn.split(":")
+        return parts[4] if len(parts) > 4 else "unknown"

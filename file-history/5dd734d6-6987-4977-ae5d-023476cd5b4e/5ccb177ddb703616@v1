@@ -1,0 +1,109 @@
+How t# AGENTS.md
+
+This is a Python project for automating the orchestration of a GDPR right to be
+forgotten request. Also known as an Erasure Request or Right to Erasure (RTE)
+Request.
+
+This project is built using Python 3.13 and should be deployed to AWS via the
+`sam` CLI tool.
+
+For more detailed information refer to the `README.md` file.
+
+## Project Details
+
+This project is managed via the `uv` tool.
+
+To make sure that all dependencies are installed run:
+
+```sh
+uv sync --all-groups
+```
+
+Never use raw `pip` or `python` commands. Always use the `uv` tool and the
+managed virtual environment it provides.
+
+To add and remove dependencies use:
+
+```sh
+uv add library
+uv remove library
+```
+
+If a library is only needed during development, you should add `--dev` to the
+`uv add` command so that it is added the `dev` dependency group.
+
+To upgrade an already added library you can use:
+
+```sh
+uv lock --upgrade-package library
+```
+
+### Testing
+
+Ideally, all code should be tested. Unit tests should be placed in the `tests/`
+directory and make use of `pytest`. To run tests, always use `uv`:
+
+```sh
+uv run pytest
+```
+
+If running in a sandbox, you may need to set the `UV_CACHE_DIR` environment
+variable in order for tests to run.
+
+### Code Quality
+
+You should run `prek` before making any commits:
+
+```sh
+uv run prek
+```
+
+This will run code quality tools, whose output you should act upon.
+
+Type checking is encouraged. Type stubs are generally stored in the `typings/`
+directory. `boto3` types are specifically provided via a file in the
+`vendored/` directory.
+
+### Type checking rule
+
+When `basedpyright` reports a type error, fix the underlying type first — narrow
+`Any`/`object`, add a precise `TypedDict` / `Protocol` / `dataclass`, use
+`typing.Self`, or `cast(T, ...)` at a single boundary.
+
+`# pyright: ignore[<rule>]` is a **last resort** and must be accompanied by a
+one-line comment explaining why the type cannot be tightened further. Never
+silence a diagnostic by widening a return type to `Any`.
+
+The canonical example of a justified ignore in this repo is `["S"]` / `["N"]`
+lookups on `dict[str, AttributeValueTypeDef]` items — see
+`src/dns_de_rte_orchestrator/audit_logging.py` (`_item_to_entry`) and
+`src/dns_de_rte_orchestrator/request_repository.py` (`response_to_request`)
+for the correct pattern using `# pyright: ignore[reportTypedDictNotRequiredAccess]`.
+
+### Deployment
+
+Deployment is done using the AWS SAM CLI tool. It should only be done by a
+human or the CI/CD pipeline.
+
+To test that building works you should validate `samconfig.toml` and
+`template.yaml` with:
+
+```sh
+sam validate --lint
+```
+
+And then perform a build with:
+
+```sh
+sam build
+```
+
+A custom `Makefile` is used to package only the needed dependencies and files
+as part of the build.
+
+Never run `sam deploy`.
+
+### Project Tracking
+
+The file `TODO.md` contains a checklist of things left to do on the project and
+should be kept up to date after making changes.

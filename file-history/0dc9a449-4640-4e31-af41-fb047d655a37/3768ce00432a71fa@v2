@@ -1,0 +1,23 @@
+# Plan: Collapse statusline into a single line
+
+## Context
+The user wants the Claude Code statusline to render all information on one line. The current script (`/Users/saurabhtyagi/.claude/statusline-command.sh`) emits a `\n` between two `printf` blocks, splitting the output across two lines.
+
+## Change
+Edit `/Users/saurabhtyagi/.claude/statusline-command.sh` lines 88–92: replace the `\n` separating the two halves with the existing `|` separator pattern, keeping all other content unchanged.
+
+### After
+```sh
+if [ -n "$effort" ]; then
+  printf "🤖 %s | 💪 %s | 🧠 %s | 💰 %s | ⏱️ %s | 📁 %s | 🌳 %s | 🌿 %s" "$model" "$effort" "$usage_str" "$block_str" "$rate_limit_str" "$dir_display" "$worktree_str" "$git_str"
+else
+  printf "🤖 %s | 🧠 %s | 💰 %s | ⏱️ %s | 📁 %s | 🌳 %s | 🌿 %s" "$model" "$usage_str" "$block_str" "$rate_limit_str" "$dir_display" "$worktree_str" "$git_str"
+fi
+```
+
+## Verification
+- Trigger a statusline refresh in Claude Code and confirm everything appears on one line.
+- Confirm both branches (with and without `effort`) render correctly.
+
+## Follow-up (separate, not part of this change)
+The earlier settings.json optimisation review is still pending — handle in a separate turn.

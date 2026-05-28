@@ -1,0 +1,97 @@
+# Plan: Address MR !62 review comment #2 — move archival out of `process_request`
+
+## Context
+
+LyndonHB left an unresolved comment on `src/dns_de_rte_orchestrator/request_processor.py:189` (`case "done": pass`):
+
+> "What's the point in this empty case?"
+
+…and on line 201 (the post-match archival block):
+
+> "Should this not be called by the `case "done"` branch?"
+
+The user has decided the right answer is the *opposite* of "move it into `case "done"`": archival is a **separate, new feature** that should not be hidden inside the per-state dispatch in `process_request`. Mixing it in there obscures the new feature and makes `process_request` responsible for two concerns (state-machine transition + archival).
+
+The intended outcome:
+
+- `process_request` keeps a single concern: dispatch the per-state handler for non-terminal states.
+- The empty `case "done": pass` is removed entirely — `process_request` is only ever invoked from `process()`, which iterates `PROCESS_STATES = ("new", "in-progress", "phase-1", "phase-2", "phase-3")` and never feeds a `"done"` request, so the branch is dead code. If something ever calls `process_request` with state `"done"`, falling through to `case _: raise NotImplementedError` is the correct, loud failure (mirrors how `"need-more-detail"` is already treated — it has no `case` and falls through today).
+- The archival call moves *out* of `process_request` and into the caller (`process()`), so it runs only after a successful `process_request` return for any request that ended up in state `"done"`.
+
+## Approach
+
+### Changes in `src/dns_de_rte_orchestrator/request_processor.py`
+
+1. **Remove the post-match archival block** from `process_request` (current lines 194–201).
+2. **Remove the `case "done": pass` branch** entirely (current lines 188–189). The match now has no `case` for the two terminal states (`"done"`, `"need-more-detail"`), which is consistent — both fall through to `case _` and raise `NotImplementedError` if someone calls `process_request` with them. That is acceptable because `process()` never does.
+3. **Add archival to `process()`** immediately after the successful `process_request` call (the `successful_request_count += 1` branch at line 136). New private helper, called only on the success path:
+   ```python
+   def _archive_if_done(self, request: ErasureRequest) -> None:
+       if self.dry_run or self.archiver is None:
+           return
+       if request.state != "done":
+           return
+       try:
+           self.archiver.archive(request.id)
+       except Exception:
+           logger.exception(
+               "Failed to archive audit log for request %s; will be retried on next invocation",
+               request.id,
+           )
+   ```
+   In `process()`:
+   ```python
+   try:
+       self.process_request(request)
+       successful_request_count += 1
+       self._archive_if_done(request)        # NEW
+   except ErasureRequestException:
+       logger.exception("Problem processing request %s", request.id)
+       failed_request_count += 1
+   ```
+   The archival call lives **outside** the try block's failure path but **inside** the success path, which matches the user's instruction ("after successful execution of process_request"). It also keeps the existing swallow-on-archiver-failure semantics local to `_archive_if_done`, so an archive failure cannot cause the request to be counted as failed (the request *did* succeed; archival is a separate post-action).
+
+### Test updates in `tests/test_request_processor.py`
+
+The existing 5 archiver tests at lines 228–280 call `proc.process_request(request)` directly with `state="done"`. After this refactor, `process_request` no longer has a `"done"` branch and will raise `NotImplementedError` for that input — so the tests must move to the new seam.
+
+Rewrite each to mirror the production call sequence: call `proc.process_request(request)` for a non-terminal state, then call `proc._archive_if_done(request)` (the new helper). This keeps unit-level coverage of all five behaviours:
+
+- `test_archiver_called_when_request_reaches_done` → drive a request whose `process_request` ends in state `"done"`. Easiest: stub the handler so it transitions to `"done"`, e.g. seed `state="phase-3"` and monkey-patch `proc.process_phase3` to call `self._transition_request(request, "done")`. Then call `_archive_if_done(request)` and assert `archive` was called.
+- `test_archiver_not_called_when_state_is_not_done` → drive `process_request` from `"new"` (transitions to `"in-progress"`), then call `_archive_if_done` and assert `archive` not called.
+- `test_archiver_not_called_in_dry_run` → same as the "called for done" setup but with `dry_run=True`; assert `archive` not called.
+- `test_archiver_exception_does_not_propagate` → same setup, archiver `side_effect = RuntimeError`; assert `_archive_if_done(request)` does not raise.
+- `test_process_request_without_archiver_does_not_raise` → same setup with `archiver=None`; assert `_archive_if_done` is a clean no-op.
+
+A new integration-style test is also worth adding to lock down the wiring inside `process()` itself:
+
+```python
+def test_process_invokes_archiver_after_successful_done_transition():
+    # Monkey-patch process_phase3 to transition to "done", seed a phase-3 request,
+    # call proc.process(), assert archiver.archive was called once with that id.
+```
+
+This proves the success-path call site, which is the actual production flow.
+
+### Files modified
+
+- `src/dns_de_rte_orchestrator/request_processor.py`
+- `tests/test_request_processor.py`
+
+### Files NOT modified
+
+- `src/dns_de_rte_orchestrator/audit_logging.py` — unchanged.
+- `src/dns_de_rte_orchestrator/processor_lambda.py` — still constructs the archiver and passes it to `RequestProcessor`. The constructor signature is unchanged.
+
+## Verification
+
+1. `uv run pytest tests/test_request_processor.py -q` — all 5 archiver tests pass with the option-C update.
+2. `uv run pytest -q` — full suite green.
+3. `uv run basedpyright src/dns_de_rte_orchestrator/request_processor.py tests/test_request_processor.py` — no new diagnostics.
+4. Visual sanity:
+   - `process_request`'s `match` no longer has a `"done"` branch and ends immediately after `case _:`.
+   - `process()` calls `_archive_if_done(request)` only on the success path of the per-request try block.
+
+## Out of scope
+
+The remaining 3 unresolved review comments (`get_logs` sort-by-timestamp, typed `DuplicateRequestError`, README reorder) are tracked separately. Comment #1 (retry refactor in `audit_logging.py`) was already implemented in the previous round.

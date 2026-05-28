@@ -1,0 +1,287 @@
+import gzip
+import json
+import logging
+import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, override
+
+import boto3
+from botocore.exceptions import ClientError
+
+if TYPE_CHECKING:
+    from types_boto3_dynamodb.client import DynamoDBClient
+    from types_boto3_s3.client import S3Client
+else:
+    DynamoDBClient = Any
+    S3Client = Any
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AuditEntry:
+    """A single audit log entry for an erasure request."""
+
+    ID_FIELD: ClassVar[Literal["id"]] = "id"
+    TIMESTAMP_FIELD: ClassVar[Literal["timestamp"]] = "timestamp"
+    MESSAGE_FIELD: ClassVar[Literal["message"]] = "message"
+
+    id: str
+    timestamp: datetime
+    message: str
+
+    def to_json(self) -> dict[str, str]:
+        return {
+            self.ID_FIELD: self.id,
+            self.TIMESTAMP_FIELD: self.timestamp.isoformat(),
+            self.MESSAGE_FIELD: self.message,
+        }
+
+    @classmethod
+    def from_json(cls, data: dict[str, str]) -> "AuditEntry":
+        return cls(
+            id=data[cls.ID_FIELD],
+            timestamp=datetime.fromisoformat(data[cls.TIMESTAMP_FIELD]),
+            message=data[cls.MESSAGE_FIELD],
+        )
+
+
+class AuditLogger(ABC):
+    """Base interface for audit logging"""
+
+    @abstractmethod
+    def log(self, id: str, message: str, timestamp: datetime | None = None) -> None:
+        """
+        Log an audit log message.
+
+        The id should be the same as an erasure requests id
+
+        The message can be any free text. You should avoid storing raw personal
+        information in messages, and make use of anonymisation functions.
+
+        The timestamp is optional and if absent will be set to now using the
+        UTC timezone. All datetimes given will be coereced to UTC.
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_logs(self, id: str) -> list[AuditEntry]:
+        """
+        Retrieve all audit log entries for the given erasure id.
+
+        Entries are returned in chronological order (oldest first). Returns
+        an empty list if no entries exist for the id.
+        """
+        raise NotImplementedError()
+
+
+class NoOpAuditLogger(AuditLogger):
+    """Audit logger implementation that does nothing"""
+
+    @override
+    def log(self, id: str, message: str, timestamp: datetime | None = None) -> None:
+        logger.warning("Audit message not saved anywhere: %s", message)
+        pass
+
+    @override
+    def get_logs(self, id: str) -> list[AuditEntry]:
+        return []
+
+
+class InMemoryAuditLogger(AuditLogger):
+    """Example implementation of audit logging by storing messages in memory"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.memory_log: list[tuple[tuple[str, datetime], str]] = []
+
+    @override
+    def log(self, id: str, message: str, timestamp: datetime | None = None) -> None:
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc)
+        else:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        self.memory_log.append(((id, timestamp), message))
+
+    @override
+    def get_logs(self, id: str) -> list[AuditEntry]:
+        entries = [
+            AuditEntry(id=entry_id, timestamp=ts, message=msg)
+            for ((entry_id, ts), msg) in self.memory_log
+            if entry_id == id
+        ]
+        entries.sort(key=lambda e: e.timestamp)
+        return entries
+
+
+class DynamoDBAuditLogger(AuditLogger):
+    """DynamoDB backed audit logging"""
+
+    def __init__(self, table_name: str, dynamodb: DynamoDBClient) -> None:
+        super().__init__()
+        self.table_name: str = table_name
+        self.dynamodb: DynamoDBClient = dynamodb
+
+    @override
+    def log(self, id: str, message: str, timestamp: datetime | None = None) -> None:
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc)
+        else:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        item = self._create_item(id, message, timestamp)
+        _ = self.dynamodb.put_item(
+            TableName=self.table_name,
+            Item=item,
+            ReturnValues="NONE",
+        )
+        logger.info("Audit Message sent: %s", message)
+
+    @override
+    def get_logs(self, id: str) -> list[AuditEntry]:
+        paginator = self.dynamodb.get_paginator("query")
+        pages = paginator.paginate(
+            TableName=self.table_name,
+            KeyConditionExpression="#id = :id",
+            ExpressionAttributeNames={"#id": AuditEntry.ID_FIELD},
+            ExpressionAttributeValues={":id": {"S": id}},
+            ScanIndexForward=True,
+        )
+        results: list[AuditEntry] = []
+        for page in pages:
+            if "Items" not in page:
+                continue
+            for item in page["Items"]:
+                results.append(self._item_to_entry(item))
+        return results
+
+    @classmethod
+    def _create_item(cls, id: str, message: str, timestamp: datetime):
+        timestamp_ms: int = int(timestamp.timestamp() * 1000)
+        item = {
+            AuditEntry.ID_FIELD: {"S": id},
+            AuditEntry.TIMESTAMP_FIELD: {"N": str(timestamp_ms)},
+            AuditEntry.MESSAGE_FIELD: {"S": message},
+        }
+        return item
+
+    @classmethod
+    def _item_to_entry(
+        cls, item: dict[str, Any]
+    ) -> AuditEntry:  # pyright: ignore[reportExplicitAny]
+        id_value: str = item[AuditEntry.ID_FIELD]["S"]  # pyright: ignore[reportAny]
+        timestamp_ms: int = int(
+            item[AuditEntry.TIMESTAMP_FIELD]["N"]
+        )  # pyright: ignore[reportAny]
+        message: str = item[AuditEntry.MESSAGE_FIELD]["S"]  # pyright: ignore[reportAny]
+        timestamp: datetime = datetime.fromtimestamp(
+            timestamp_ms / 1000, tz=timezone.utc
+        )
+        return AuditEntry(id=id_value, timestamp=timestamp, message=message)
+
+
+class S3AuditLogReader:
+    """Reads materialised audit logs from S3.
+
+    Each erasure request's complete audit log is stored as a single gzipped
+    JSON Lines object at ``s3://{bucket}/{prefix}/{id}.jsonl.gz``.
+    """
+
+    def __init__(self, bucket: str, prefix: str, s3_client: S3Client) -> None:
+        self.bucket: str = bucket
+        self.prefix: str = prefix.strip("/")
+        self.s3: S3Client = s3_client
+
+    def _key_for(self, id: str) -> str:
+        if self.prefix:
+            return f"{self.prefix}/{id}.jsonl.gz"
+        return f"{id}.jsonl.gz"
+
+    def get_logs(self, id: str) -> list[AuditEntry]:
+        key = self._key_for(id)
+        try:
+            response = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in ("NoSuchKey", "404", "NoSuchBucket"):
+                return []
+            raise
+
+        body_bytes: bytes = response["Body"].read()
+        decompressed = gzip.decompress(body_bytes).decode("utf-8")
+        entries: list[AuditEntry] = []
+        for line in decompressed.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            entries.append(
+                AuditEntry.from_json(json.loads(stripped))
+            )  # pyright: ignore[reportAny]
+        return entries
+
+
+class FallbackAuditLogReader:
+    """Reads audit logs from a primary source, falling back to S3 when empty."""
+
+    def __init__(self, primary: AuditLogger, fallback: S3AuditLogReader) -> None:
+        self.primary: AuditLogger = primary
+        self.fallback: S3AuditLogReader = fallback
+
+    def get_logs(self, id: str) -> list[AuditEntry]:
+        primary_results = self.primary.get_logs(id)
+        if primary_results:
+            return primary_results
+        logger.info(
+            "No audit logs found in primary store for id %s, falling back to S3", id
+        )
+        return self.fallback.get_logs(id)
+
+
+DYNAMO_DB_AUDIT_LOGGING_TABLE: Literal["DYNAMO_DB_AUDIT_LOGGING_TABLE"] = (
+    "DYNAMO_DB_AUDIT_LOGGING_TABLE"
+)
+"""Environment variable used for configuring the audit logging table"""
+
+AUDIT_LOG_S3_BUCKET: Literal["AUDIT_LOG_S3_BUCKET"] = "AUDIT_LOG_S3_BUCKET"
+"""Environment variable used for the S3 bucket holding materialised audit logs"""
+
+AUDIT_LOG_S3_PREFIX: Literal["AUDIT_LOG_S3_PREFIX"] = "AUDIT_LOG_S3_PREFIX"
+"""Environment variable used for the key prefix of materialised audit logs"""
+
+
+def get_audit_logger() -> AuditLogger:
+    """Get a concrete audit logger via environment variables"""
+    table_name: str | None = os.getenv(DYNAMO_DB_AUDIT_LOGGING_TABLE)
+    if table_name is not None:
+        return get_dynamodb_audit_logger(table_name)
+    else:
+        logger.warning("No Audit Logging enabled")
+        return NoOpAuditLogger()
+
+
+def get_dynamodb_audit_logger(table_name: str) -> DynamoDBAuditLogger:
+    dynamodb: DynamoDBClient = boto3.client("dynamodb")
+    return DynamoDBAuditLogger(table_name, dynamodb)
+
+
+def get_s3_audit_log_reader(bucket: str, prefix: str) -> S3AuditLogReader:
+    s3: S3Client = boto3.client("s3")
+    return S3AuditLogReader(bucket=bucket, prefix=prefix, s3_client=s3)
+
+
+def get_audit_log_reader() -> FallbackAuditLogReader:
+    """Get an audit log reader configured from environment variables.
+
+    Uses the DynamoDB-backed audit logger as the primary source and an S3
+    reader as the fallback. Both must be configured via environment.
+    """
+    primary: AuditLogger = get_audit_logger()
+
+    bucket: str | None = os.getenv(AUDIT_LOG_S3_BUCKET)
+    if bucket is None or bucket == "":
+        raise ValueError(f"{AUDIT_LOG_S3_BUCKET} was not set")
+    prefix: str = os.getenv(AUDIT_LOG_S3_PREFIX, "")
+
+    fallback = get_s3_audit_log_reader(bucket=bucket, prefix=prefix)
+    return FallbackAuditLogReader(primary=primary, fallback=fallback)

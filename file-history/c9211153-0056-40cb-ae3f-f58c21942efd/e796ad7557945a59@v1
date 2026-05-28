@@ -1,0 +1,96 @@
+from dataclasses import dataclass, fields
+from datetime import datetime
+from typing import Literal, override
+
+type ErasureState = Literal[
+    "new", "in-progress", "phase-1", "phase-2", "phase-3", "done", "need-more-detail"
+]
+"""Valid erasure states type"""
+
+type ErasureDetailKey = Literal[
+    "first-name", "last-name", "email", "postcode", "phone-number", "rfl", "last-order"
+]
+"""Expected erasure details keys"""
+
+VALID_STATES: tuple[ErasureState, ...] = (
+    "new",
+    "in-progress",
+    "phase-1",
+    "phase-2",
+    "phase-3",
+    "done",
+    "need-more-detail",
+)
+"""Valid erasure states"""
+
+
+@dataclass
+class ErasureRequest:
+    """
+    An Erasure request as submitted by a source system.
+
+    The normal source system is OneTrust.
+    """
+
+    id: str
+    """
+    A unique identifier for this erasure request.
+    This should come from the source system.
+    """
+
+    source: str
+    """The source of this Erasure request"""
+
+    state: ErasureState
+    """The state that the request is in"""
+
+    date_issued: datetime
+    """The date (and time) that this request was issued at"""
+
+    # TODO: Perhaps turn erasure_details into its own domain object
+    erasure_details: dict[ErasureDetailKey, str]
+    """
+    Specific details for this erasure.
+
+    This is a sensitive field as it will contain the likes of email addresses,
+    addresses etc.
+
+    The erasure details we normally get from OneTrust are:
+
+    - First Name
+    - Last Name
+    - Email
+    - Postcode
+
+    With the optional ones being:
+
+    - Phone Number
+    - RFL Number
+    - Last Order Number
+    """
+
+    # Below code attempts to omit the erasure_details from inclusing in strings
+    # by mistake
+
+    def _safe_dict(self) -> dict[str, str]:
+        return {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if f.name not in ["erasure_details"]
+        }
+
+    @override
+    def __str__(self):
+        d = self._safe_dict()
+        return f"ErasureRequest(id={d['id']}, source={d['source']}, state={d['state']}, date_issued={d['date_issued']})"
+
+    @override
+    def __repr__(self):
+        d = self._safe_dict()
+        return f"ErasureRequest(**{d})"
+
+    @property
+    def date_issued_ms(self) -> int:
+        """The date and time issued as a unix timestamp (milliseconds)"""
+        timestamp_ms = int(self.date_issued.timestamp() * 1000)
+        return timestamp_ms

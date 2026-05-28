@@ -1,0 +1,43 @@
+from typing import Any
+
+from aws_lambda_powertools import Logger
+from aws_lambda_powertools.tracing import Tracer
+from aws_lambda_powertools.utilities.typing import LambdaContext
+from dotenv import load_dotenv
+
+from dns_de_rte_orchestrator.erasure_request import ErasureRequest
+
+from .request_repository import RequestRepository, get_request_repository
+
+# Load .env file, mostly useful for testing
+_ = load_dotenv()
+
+logger = Logger()
+tracer = Tracer()  # Sets service via POWERTOOLS_SERVICE_NAME env var
+
+request_repo: RequestRepository = get_request_repository()
+
+
+def request_from_event(
+    _event: dict[Any, Any],  # pyright: ignore[reportExplicitAny]
+) -> ErasureRequest:
+    """Convert the input event into an ErasureRequest"""
+    # TODO: Implement erasure request conversion
+    raise NotImplementedError("Request conversion not implemented")
+
+
+@tracer.capture_lambda_handler
+@logger.inject_lambda_context
+def lambda_handler(
+    event: dict[Any, Any],  # pyright: ignore[reportExplicitAny]
+    _context: LambdaContext,
+) -> None:
+    """
+    Entrypoint for AWS Lambda that does item creation.
+
+    This should be very simple, the Lambda should simply create an entry in the
+    underlying storage, another lambda or piece of compute will process them.
+    """
+
+    request: ErasureRequest = request_from_event(event)
+    request_repo.create(request)
