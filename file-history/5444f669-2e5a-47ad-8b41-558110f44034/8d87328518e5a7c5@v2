@@ -1,0 +1,124 @@
+import os
+from datetime import datetime, timedelta
+from typing import Any, Final, Literal
+
+from aws_lambda_powertools import Logger
+from aws_lambda_powertools.tracing import Tracer
+from aws_lambda_powertools.utilities.typing import LambdaContext
+from dotenv import load_dotenv
+
+from dns_de_rte_orchestrator.as400 import AS400Notifier, NoOpAS400Notifier
+from dns_de_rte_orchestrator.audit_logging import (
+    AuditArchiver,
+    AuditLogger,
+    get_audit_log_archiver,
+    get_audit_logger,
+)
+from dns_de_rte_orchestrator.customer_api_client import (
+    CustomerAPIClient,
+    HTTPCustomerAPIClient,
+)
+from dns_de_rte_orchestrator.customer_erasures_api_client import (
+    CustomerErasureAPI,
+    get_customer_erasures_api_from_env,
+)
+from dns_de_rte_orchestrator.dryrun import is_dry_run
+from dns_de_rte_orchestrator.request_processor import RequestProcessor
+from dns_de_rte_orchestrator.request_repository import (
+    RequestRepository,
+    get_request_repository,
+)
+from dns_de_rte_orchestrator.zendesk import ZendeskErasureAPI, get_zendesk_api_from_env
+
+SAFETY_MARGIN_MS_ENV_VAR: Literal["PROCESS_SAFETY_MARGIN_MS"] = (
+    "PROCESS_SAFETY_MARGIN_MS"
+)
+DEFAULT_SAFETY_MARGIN_MS: Literal[1000] = 1000
+
+CUSTOMER_API_URL_ENV_VAR: Literal["CUSTOMER_API_URL"] = "CUSTOMER_API_URL"
+
+
+def get_customer_api_url() -> str:
+    """Get the Customer API URL from the environment, throwing a ValueError if not found"""
+    url = os.getenv(CUSTOMER_API_URL_ENV_VAR)
+    if url is None:
+        raise ValueError(f"{CUSTOMER_API_URL_ENV_VAR} is not defined")
+    return url
+
+
+# Load .env file, mostly useful for testing
+_ = load_dotenv()
+
+logger = Logger()
+tracer = Tracer()  # Sets service via POWERTOOLS_SERVICE_NAME env var
+
+customer_api_url: str = get_customer_api_url()
+in_dry_run_mode: Final[bool] = is_dry_run()
+request_repo: RequestRepository = get_request_repository()
+audit: AuditLogger = get_audit_logger()
+as400: AS400Notifier = NoOpAS400Notifier()  # TODO: add actual AS400 notifying
+customer_api: CustomerAPIClient = HTTPCustomerAPIClient(customer_api_url)
+customer_erasures_api: CustomerErasureAPI = get_customer_erasures_api_from_env()
+zendesk_api: ZendeskErasureAPI = get_zendesk_api_from_env()
+
+archiver: AuditArchiver | None = None
+try:
+    archiver = get_audit_log_archiver()
+except ValueError:
+    logger.warning("Audit log archiver not configured; archival will be skipped")
+
+processor: RequestProcessor = RequestProcessor(
+    request_repo,
+    audit,
+    as400,
+    customer_api,
+    customer_erasures_api,
+    zendesk_api,
+    dry_run=in_dry_run_mode,
+    archiver=archiver,
+)
+
+
+def get_safety_margin_ms() -> int:
+    """Get the safety margin in milliseconds from the environment"""
+    from_env = os.getenv("PROCESS_SAFETY_MARGIN_MS")
+    safety_margin_ms: int = DEFAULT_SAFETY_MARGIN_MS
+    if from_env is not None:
+        try:
+            safety_margin_ms = int(from_env)
+        except ValueError:
+            logger.error(
+                "Could not parse %s value %s as an integer",
+                SAFETY_MARGIN_MS_ENV_VAR,
+                from_env,
+            )
+    return safety_margin_ms
+
+
+def get_timeout_datetime(remaining_millis: int) -> datetime:
+    """Convert a remaining millis into a datetime"""
+    delta = timedelta(milliseconds=remaining_millis)
+    return datetime.now() + delta
+
+
+@tracer.capture_lambda_handler
+@logger.inject_lambda_context
+def lambda_handler(
+    _event: dict[Any, Any],  # pyright: ignore[reportExplicitAny]
+    context: LambdaContext,
+) -> None:
+    """
+    Entrypoint for AWS Lambda that does erasure request processing.
+    """
+
+    # Add a margin for safety so Lambdas don't timeout mid process
+    safety_margin_ms: int = get_safety_margin_ms()
+
+    remaining_millis = context.get_remaining_time_in_millis() - safety_margin_ms
+    timeout: datetime = get_timeout_datetime(remaining_millis)
+    logger.info(
+        f"Processing events with a timeout of {remaining_millis}ms until {timeout}"
+    )
+
+    # Actual processing logic should be isolated in the processor class
+    processor.process(timeout)

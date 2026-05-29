@@ -1,0 +1,130 @@
+# Plan: Merge origin/master into DATA_4715_audit_log_to_s3
+
+## Context
+
+`origin/master` has advanced 2 commits since our branch diverged (`a362723`):
+- `64aecc7` — "Implement Phase-2 and Phase-3 Customer erasure process"
+- `09dd169` — Merge commit
+
+The master changes implement Phase-2 (Customer Erasures API, Zendesk) and Phase-3 by adding `CustomerErasureAPI`, `ZendeskErasureAPI`, `customer_erasures_api_client.py`, `zendesk.py`, wiring them into `RequestProcessor`, `processor_lambda`, and expanding `test_request_processor.py` substantially.
+
+A dry-run `git merge origin/master` produced **4 conflict files**:
+
+1. `src/dns_de_rte_orchestrator/processor_lambda.py` — AUTO-MERGED cleanly (no conflict marker left; git resolved it)
+2. `src/dns_de_rte_orchestrator/request_processor.py` — CONFLICT
+3. `template.yaml` — CONFLICT
+4. `tests/test_request_processor.py` — CONFLICT
+
+## Conflict analysis and resolution approach
+
+### 1. `src/dns_de_rte_orchestrator/request_processor.py`
+
+Two independent conflicts:
+
+**Conflict A — `__init__` signature (lines ~54–66 with markers)**
+
+- `HEAD` (ours): adds `archiver: AuditArchiver | None = None` parameter and `self.archiver` assignment; removes `erasures_api`/`zendesk` params.
+- `origin/master` (theirs): adds `erasures_api: CustomerErasureAPI`, `zendesk: ZendeskErasureAPI` params and their assignments; keeps archiver absent.
+
+Resolution — **take both**: the merged `__init__` must include all four new parameters in correct declaration order:
+```python
+def __init__(
+    self,
+    repository: RequestRepository,
+    audit: AuditLogger,
+    as400: AS400Notifier,
+    customer_api: CustomerAPIClient,
+    erasures_api: CustomerErasureAPI,
+    zendesk: ZendeskErasureAPI,
+    dry_run: bool = False,
+    archiver: AuditArchiver | None = None,
+) -> None:
+    ...
+    self.customer_api: CustomerAPIClient = customer_api
+    self.erasures_api: CustomerErasureAPI = erasures_api
+    self.zendesk: ZendeskErasureAPI = zendesk
+    self.archiver: AuditArchiver | None = archiver
+    if dry_run:
+        ...
+```
+Imports must include `CustomerErasureAPI`, `ZendeskErasureAPI` etc. from master's additions, PLUS `AuditArchiver` from ours.
+
+**Conflict B — `process()` try/except block (lines ~148–170 with markers)**
+
+- `HEAD` (ours): replaces `successful_request_count += 1` before the except with a `continue` inside the except, then increments `successful_request_count` and calls `self._archive_if_done(request)` on the success path.
+- `origin/master` (theirs): adds a second `except Exception:` broad catch with a descriptive comment and `failed_request_count += 1`.
+
+Resolution — **take both**: keep our success-path structure (`continue` in the `ErasureRequestException` handler, then `successful_request_count += 1; self._archive_if_done(request)` after the try block) AND add master's broad `except Exception` below the `ErasureRequestException` handler:
+```python
+try:
+    self.process_request(request)
+except ErasureRequestException:
+    logger.exception("Problem processing request %s", request.id)
+    failed_request_count += 1
+    continue
+except Exception:
+    # This branch will catch any bubbled up exceptions not wrapped by
+    # domain exceptions. This should not really happen as we should be
+    # handling the possible error states.
+    logger.exception("Unknown problem processing request %s", request.id)
+    failed_request_count += 1
+    continue
+successful_request_count += 1
+self._archive_if_done(request)
+```
+
+The imports at the top of `request_processor.py` must also include master's additions (`CustomerErasureAPI`, `CustomerErasureAPIException`, `ZendeskErasureAPI`, `ZendeskTicketId`, `ZendeskUserId`).
+
+### 2. `template.yaml`
+
+The conflict region is around the `ProcessFunction` SAM resource. Our branch added `AuditLogS3Bucket`/`AuditLogS3Prefix` parameters and the `ProcessS3WritePolicy` IAM resource. Master added the `CustomerErasuresApiUrl`, `ZendeskApiUrl`, `ZendeskApiToken` parameters and their env vars to `ProcessFunction`.
+
+Resolution — **take both** additively: all parameters from both branches survive; `ProcessFunction.Environment.Variables` includes all env vars from both; `ProcessS3WritePolicy` (ours) and any new IAM resources from master both survive.
+
+### 3. `tests/test_request_processor.py`
+
+Two conflicts at the top:
+
+**Conflict A — imports**
+- `HEAD`: `from pytest import MonkeyPatch` + `AuditArchiver, NoOpAuditLogger`
+- master: `from _pytest.logging import LogCaptureFixture` + `InMemoryAuditLogger, NoOpAuditLogger` + many new imports (`CustomerErasureAPI`, `ZendeskErasureAPI`, etc.)
+
+Resolution — **take all**: `from pytest import MonkeyPatch` (ours) AND `from _pytest.logging import LogCaptureFixture` (theirs); `AuditArchiver` from ours; `InMemoryAuditLogger` and the new API imports from theirs.
+
+**Conflict B — `ErasureState` import**
+- `HEAD`: `from dns_de_rte_orchestrator.erasure_request import ErasureRequest, ErasureState`
+- master: `from dns_de_rte_orchestrator.erasure_request import ErasureRequest` (no `ErasureState`)
+
+Resolution — keep `ErasureState` (ours uses it for `_make_request(state: ErasureState)` helper) while also accepting master's new imports. Check if master's test additions use `ErasureState`; if not, keeping it is harmless.
+
+The `_build_processor` factory helper in the test file also needs to be updated to pass the new required `erasures_api` and `zendesk` params when constructing `RequestProcessor` — both branches will have touched this.
+
+### 4. `src/dns_de_rte_orchestrator/processor_lambda.py`
+
+Git reports auto-merged (no conflict markers). After merge, `processor_lambda.py` will include master's `customer_erasures_api`/`zendesk_api` wiring AND our archiver wiring. The `RequestProcessor(...)` call must pass all arguments: `request_repo, audit, as400, customer_api, customer_erasures_api, zendesk_api, dry_run=in_dry_run_mode, archiver=archiver`.
+
+## Step-by-step implementation
+
+1. `git merge origin/master` — starts the merge, leaves conflict markers.
+2. Resolve `request_processor.py` — take both sides of both conflicts as described.
+3. Resolve `template.yaml` — take all parameters and env vars from both sides.
+4. Resolve `tests/test_request_processor.py` — take all imports from both sides; verify `_build_processor` passes `erasures_api` and `zendesk` to `RequestProcessor`.
+5. Check `processor_lambda.py` auto-merge result — verify `RequestProcessor(...)` call includes all 8 arguments.
+6. `uv run pytest -q` — full suite must be green.
+7. `uv run basedpyright` — no new errors.
+8. `git add` resolved files + `git commit` with a merge commit.
+9. `git push origin DATA_4715_audit_log_to_s3`.
+
+## Files modified
+
+- `src/dns_de_rte_orchestrator/request_processor.py` — conflict resolution (both sets of changes)
+- `src/dns_de_rte_orchestrator/processor_lambda.py` — verify auto-merge; fix `RequestProcessor` call args
+- `template.yaml` — conflict resolution (all parameters/env vars)
+- `tests/test_request_processor.py` — conflict resolution (all imports; `_build_processor` factory args)
+
+## Verification
+
+1. `uv run pytest -q` — all tests green (expected ~220+ tests from both branches combined)
+2. `uv run basedpyright` — 0 errors, 0 warnings
+3. `sam validate --lint` — SAM template valid
+4. `git log --oneline origin/master..HEAD` — shows our 11 branch commits + the merge commit on top

@@ -1,0 +1,977 @@
+import uuid
+from copy import deepcopy
+from datetime import datetime, timedelta
+from typing import cast, override
+from unittest.mock import MagicMock
+
+import pytest
+from _pytest.logging import LogCaptureFixture
+from pytest import MonkeyPatch
+
+from dns_de_rte_orchestrator.as400 import NoOpAS400Notifier
+from dns_de_rte_orchestrator.audit_logging import (
+    AuditArchiver,
+    InMemoryAuditLogger,
+    NoOpAuditLogger,
+)
+from dns_de_rte_orchestrator.customer_api_client import (
+    CustomerAPIClient,
+    CustomerAPISiteID,
+    CustomerDetails,
+)
+from dns_de_rte_orchestrator.customer_erasures_api_client import (
+    CustomerErasureAPI,
+    CustomerErasureAPIException,
+    CustomerErasureAPIRequestId,
+    ErasureAPIResponse,
+    ErasureAPITask,
+)
+from dns_de_rte_orchestrator.erasure_request import ErasureRequest, ErasureState
+from dns_de_rte_orchestrator.request_processor import (
+    MissingEmailAddress,
+    ProblemWithErasuresAPI,
+    RequestProcessor,
+    StillExistsAfterErasure,
+)
+from dns_de_rte_orchestrator.request_repository import InMemoryRequestRepository
+from dns_de_rte_orchestrator.zendesk import (
+    NoOpZendeskErasureAPI,
+    ZendeskErasureAPI,
+    ZendeskTicketId,
+    ZendeskUserId,
+)
+
+
+class StubCustomerAPI(CustomerAPIClient):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stored_details: dict[
+            tuple[str, CustomerAPISiteID | None], list[CustomerDetails]
+        ] = {}
+
+    @override
+    def get_customer_details(
+        self, email: str, site_id: CustomerAPISiteID | None = None
+    ) -> list[CustomerDetails]:
+        key = (email, site_id)
+        if key in self._stored_details:
+            return self._stored_details[key]
+        return []
+
+    def add_results_for(
+        self,
+        email: str,
+        site_id: CustomerAPISiteID | None,
+        results: list[CustomerDetails],
+    ) -> None:
+        if len(results) <= 0:
+            return
+        key = (email, site_id)
+        existing_list = self._stored_details.get(key)
+        if not existing_list:
+            existing_list = []
+        existing_list.extend(results)
+        self._stored_details[key] = existing_list
+
+
+class RecordingCustomerAPI(StubCustomerAPI):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, CustomerAPISiteID | None]] = []
+
+    @override
+    def get_customer_details(
+        self, email: str, site_id: CustomerAPISiteID | None = None
+    ) -> list[CustomerDetails]:
+        self.calls.append((email, site_id))
+        return super().get_customer_details(email, site_id)
+
+
+class StubErasuresAPI(CustomerErasureAPI):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.responses: dict[str, ErasureAPIResponse] = {}
+
+    @override
+    def check_erasure(self, request: ErasureRequest) -> ErasureAPIResponse:
+        key = request.erasure_service_id
+        if key is None:
+            raise ValueError("Missing erasure service id")
+        result = self.responses.get(key)
+        if result is None:
+            raise ValueError(f"id {key} not in API")
+        return result
+
+    @override
+    def trigger_erasure(self, request: ErasureRequest) -> CustomerErasureAPIRequestId:
+        if request.erasure_service_id is not None:
+            raise ValueError("Already raised with erasure service")
+
+        result = self.generate_default_entry(request)
+        request.erasure_service_id = result.request_id
+        return request.erasure_service_id
+
+    def generate_default_entry(self, _request: ErasureRequest) -> ErasureAPIResponse:
+        uid = str(uuid.uuid4())
+        tasks: dict[str, ErasureAPITask] = {}
+        # TODO: Not sure what a default set of tasks should look like
+        return ErasureAPIResponse(uid, tasks)
+
+
+class DeterministicTriggerErasuresAPI(StubErasuresAPI):
+
+    @override
+    def generate_default_entry(self, _request: ErasureRequest) -> ErasureAPIResponse:
+        tasks: dict[str, ErasureAPITask] = {}
+        return ErasureAPIResponse("svc-123", tasks)
+
+
+class RecordingCheckErasuresAPI(StubErasuresAPI):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.check_calls: list[str | None] = []
+
+    @override
+    def check_erasure(self, request: ErasureRequest) -> ErasureAPIResponse:
+        self.check_calls.append(request.erasure_service_id)
+        key = request.erasure_service_id
+        if key is None:
+            raise ValueError("Missing erasure service id")
+        result = self.responses.get(key)
+        if result is not None:
+            return result
+        return ErasureAPIResponse(
+            "svc-123",
+            {"send-email": ErasureAPITask("SUCCESS", None)},
+        )
+
+
+class FailingCheckErasuresAPI(StubErasuresAPI):
+
+    @override
+    def check_erasure(self, request: ErasureRequest) -> ErasureAPIResponse:
+        raise CustomerErasureAPIException("boom")
+
+
+class RecordingTriggerErasuresAPI(StubErasuresAPI):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.trigger_calls: list[str] = []
+
+    @override
+    def trigger_erasure(self, request: ErasureRequest) -> CustomerErasureAPIRequestId:
+        self.trigger_calls.append(request.id)
+        return super().trigger_erasure(request)
+
+
+class RecordingZendeskAPI(ZendeskErasureAPI):
+
+    def __init__(
+        self,
+        tickets: list[ZendeskTicketId] | None = None,
+        users: list[ZendeskUserId] | None = None,
+    ) -> None:
+        super().__init__()
+        self.tickets: list[ZendeskTicketId] = tickets or []
+        self.users: list[ZendeskUserId] = users or []
+        self.calls: list[tuple[str, object]] = []
+
+    @override
+    def find_tickets(self, request: ErasureRequest) -> list[str]:
+        self.calls.append(("find_tickets", request.id))
+        return self.tickets
+
+    @override
+    def delete_tickets(self, tickets: list[str]) -> None:
+        self.calls.append(("delete_tickets", list(tickets)))
+
+    @override
+    def purge_tickets(self, tickets: list[str]) -> None:
+        self.calls.append(("purge_tickets", list(tickets)))
+
+    @override
+    def find_users(self, request: ErasureRequest) -> list[str]:
+        self.calls.append(("find_users", request.id))
+        return self.users
+
+    @override
+    def delete_user(self, user: str) -> None:
+        self.calls.append(("delete_user", user))
+
+    @override
+    def purge_user(self, user: str) -> None:
+        self.calls.append(("purge_user", user))
+
+
+class FailingZendeskAPI(RecordingZendeskAPI):
+
+    @override
+    def find_users(self, request: ErasureRequest) -> list[str]:
+        self.calls.append(("find_users", request.id))
+        raise RuntimeError("zendesk failed")
+
+
+class RecordingRequestRepository(InMemoryRequestRepository):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.update_calls: int = 0
+
+    @override
+    def create(self, request: ErasureRequest) -> None:
+        super().create(deepcopy(request))
+
+    @override
+    def update(self, request: ErasureRequest) -> None:
+        self.update_calls += 1
+        super().update(deepcopy(request))
+
+
+def make_processor(
+    repository: InMemoryRequestRepository,
+    audit: InMemoryAuditLogger | NoOpAuditLogger,
+    as400: NoOpAS400Notifier,
+    customer_api: CustomerAPIClient,
+    erasures_api: CustomerErasureAPI,
+    zendesk: ZendeskErasureAPI | None = None,
+) -> RequestProcessor:
+    return RequestProcessor(
+        repository=repository,
+        audit=audit,
+        as400=as400,
+        customer_api=customer_api,
+        erasures_api=erasures_api,
+        zendesk=zendesk or NoOpZendeskErasureAPI(),
+    )
+
+
+def test_checking_timeout():
+    proc = make_processor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=StubErasuresAPI(),
+    )
+    assert not proc._check_timeout()  # pyright: ignore[reportPrivateUsage]
+    minutes_ago = datetime.now() - timedelta(minutes=10)
+    assert proc._check_timeout(minutes_ago)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_throws_for_missing_email_on_new():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="new",
+        date_issued=datetime.now(),
+        erasure_details={},
+        site_ids=[],
+        erasure_service_id=None,
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+
+    proc = make_processor(
+        repository=repo,
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=StubErasuresAPI(),
+    )
+
+    with pytest.raises(MissingEmailAddress):
+        proc.process_new(request)
+
+
+def test_empty_enrichment():
+    proc = make_processor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=StubErasuresAPI(),
+    )
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="in-progress",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id=None,
+    )
+    proc.enrich_request(request)
+
+
+def _make_archiver_mock() -> MagicMock:
+    return MagicMock(spec=AuditArchiver)
+
+
+def _build_processor(
+    archiver: AuditArchiver | None = None,
+    dry_run: bool = False,
+) -> tuple[RequestProcessor, InMemoryRequestRepository]:
+    repo = InMemoryRequestRepository()
+    proc = RequestProcessor(
+        repository=repo,
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=StubErasuresAPI(),
+        zendesk=NoOpZendeskErasureAPI(),
+        dry_run=dry_run,
+        archiver=archiver,
+    )
+    return proc, repo
+
+
+def _make_request(state: ErasureState = "new") -> ErasureRequest:
+    return ErasureRequest(
+        id="req-archive",
+        source="test",
+        state=state,
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id=None,
+    )
+
+
+def test_enrichment_fails_for_missing_email():
+    proc = make_processor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=StubErasuresAPI(),
+    )
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="in-progress",
+        date_issued=datetime.now(),
+        erasure_details={},
+        site_ids=[],
+        erasure_service_id=None,
+    )
+    with pytest.raises(MissingEmailAddress):
+        proc.enrich_request(request)
+
+
+def test_enrichment():
+    email: str = "example@foo.com"
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="in-progress",
+        date_issued=datetime.now(),
+        erasure_details={"email": email},
+        site_ids=[],
+        erasure_service_id=None,
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+
+    customer_api = StubCustomerAPI()
+    first_name = "bob"
+    last_name = "martin"
+    loyalty = "loyal-12"
+    mobile = "077"
+    customer_api.add_results_for(
+        email,
+        10,
+        [
+            CustomerDetails(
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
+                site_id=10,
+                mobile_number=None,
+                loyalty_number=None,
+                och_id=None,
+                digital_identity_id=None,
+            ),
+        ],
+    )
+    customer_api.add_results_for(
+        email,
+        20,
+        [
+            CustomerDetails(
+                first_name="robert",  # should default to first found
+                last_name=None,
+                email=email,
+                site_id=20,
+                mobile_number=mobile,
+                loyalty_number=loyalty,
+                och_id=None,
+                digital_identity_id=None,
+            ),
+        ],
+    )
+
+    proc = make_processor(
+        repository=repo,
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=customer_api,
+        erasures_api=StubErasuresAPI(),
+    )
+
+    proc.enrich_request(request)
+    enriched_details = request.erasure_details
+    assert enriched_details["first-name"] == first_name
+    assert enriched_details["last-name"] == last_name
+    assert enriched_details["phone-number"] == mobile
+    assert enriched_details["rfl"] == loyalty
+    assert request.site_ids == [10, 20]
+
+
+# --- Archiver integration via process() ---
+# Archival runs inside process() after a successful process_request call.
+
+
+def test_archiver_called_after_phase3_reaches_done() -> None:
+    """Integration: process_phase3 transitions to done → archiver fires via process().
+
+    process_phase3 transitions to "done" when the customer is no longer found in
+    the Customer API. StubCustomerAPI returns no results by default, so this test
+    exercises the real production path without monkeypatching.
+    """
+    archiver_mock = _make_archiver_mock()
+    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
+    request = _make_request(state="phase-3")
+    repo.create(request)
+
+    proc.process()
+
+    cast(MagicMock, archiver_mock.archive).assert_called_once_with("req-archive")
+
+
+def _seed_done_via_phase1(monkeypatch: MonkeyPatch, proc: RequestProcessor) -> None:
+    """Patch process_phase1 to transition to "done" and seed repo with a phase-1 request."""
+
+    def _fake_phase1(request: ErasureRequest) -> None:
+        request.state = "done"
+        proc.repo.update(request)
+
+    monkeypatch.setattr(proc, "process_phase1", _fake_phase1)
+
+
+def test_archiver_called_when_request_reaches_done(monkeypatch: MonkeyPatch) -> None:
+    archiver_mock = _make_archiver_mock()
+    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
+    _seed_done_via_phase1(monkeypatch, proc)
+    request = _make_request(state="phase-1")
+    repo.create(request)
+
+    proc.process()
+
+    cast(MagicMock, archiver_mock.archive).assert_called_once_with("req-archive")
+
+
+def test_archiver_not_called_when_state_is_not_done(monkeypatch: MonkeyPatch) -> None:
+    archiver_mock = _make_archiver_mock()
+    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
+
+    # Patch process_phase1 to leave the request in phase-1 (not done) so archive must not fire
+    def _noop_phase1(_req: ErasureRequest) -> None:
+        pass
+
+    monkeypatch.setattr(proc, "process_phase1", _noop_phase1)
+    request = _make_request(state="phase-1")
+    repo.create(request)
+
+    proc.process()
+
+    cast(MagicMock, archiver_mock.archive).assert_not_called()
+
+
+def test_archiver_not_called_in_dry_run(monkeypatch: MonkeyPatch) -> None:
+    archiver_mock = _make_archiver_mock()
+    proc, repo = _build_processor(
+        archiver=cast(AuditArchiver, archiver_mock), dry_run=True
+    )
+    _seed_done_via_phase1(monkeypatch, proc)
+    request = _make_request(state="phase-1")
+    repo.create(request)
+
+    proc.process()
+
+    cast(MagicMock, archiver_mock.archive).assert_not_called()
+
+
+def test_archiver_exception_does_not_propagate(monkeypatch: MonkeyPatch) -> None:
+    archiver_mock = _make_archiver_mock()
+    cast(MagicMock, archiver_mock.archive).side_effect = RuntimeError("S3 down")
+    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
+    _seed_done_via_phase1(monkeypatch, proc)
+    request = _make_request(state="phase-1")
+    repo.create(request)
+
+    proc.process()  # should not raise even though archiver fails
+    cast(MagicMock, archiver_mock.archive).assert_called_once_with("req-archive")
+
+
+def test_process_request_without_archiver_does_not_raise(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    proc, repo = _build_processor(archiver=None)
+    _seed_done_via_phase1(monkeypatch, proc)
+    request = _make_request(state="phase-1")
+    repo.create(request)
+
+    proc.process()  # no archiver configured — must not raise
+
+
+def test_process_phase2_submits_erasure_and_logs_message():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-2",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id=None,
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+    audit = InMemoryAuditLogger()
+    erasures_api = DeterministicTriggerErasuresAPI()
+    proc = make_processor(
+        repository=repo,
+        audit=audit,
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=erasures_api,
+    )
+
+    proc.process_phase2(request)
+
+    stored_request = repo.get(request.id)
+    assert stored_request is not None
+    assert request.erasure_service_id == "svc-123"
+    assert stored_request.erasure_service_id == "svc-123"
+    assert audit.get_logs(request.id)[0].message == (
+        "Sent request to erasures API service and got id back: svc-123"
+    )
+
+
+def test_process_phase2_dry_run_does_not_submit_erasure_when_service_id_missing(
+    caplog: LogCaptureFixture,
+):
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-2",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id=None,
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+    erasures_api = RecordingTriggerErasuresAPI()
+    proc = RequestProcessor(
+        repository=repo,
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=erasures_api,
+        zendesk=NoOpZendeskErasureAPI(),
+        dry_run=True,
+    )
+
+    with caplog.at_level("INFO", logger="dns_de_rte_orchestrator.request_processor"):
+        proc.process_phase2(request)
+
+    stored_request = repo.get(request.id)
+    assert stored_request is not None
+    assert request.state == "phase-2"
+    assert stored_request.state == "phase-2"
+    assert request.erasure_service_id is None
+    assert erasures_api.trigger_calls == []
+    assert "Would have submitted erasure request to API for test_id" in caplog.text
+
+
+def test_submit_erasure_to_apis_transitions_to_need_more_detail_when_email_missing():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-2",
+        date_issued=datetime.now(),
+        erasure_details={},
+        site_ids=[],
+        erasure_service_id=None,
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+    proc = make_processor(
+        repository=repo,
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=StubErasuresAPI(),
+    )
+
+    proc.submit_erasure_to_apis(request)
+
+    stored_request = repo.get(request.id)
+    assert stored_request is not None
+    assert request.state == "need-more-detail"
+    assert stored_request.state == "need-more-detail"
+    assert request.erasure_service_id is None
+
+
+def test_process_phase2_checks_existing_erasure_status():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-2",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id="svc-123",
+    )
+    erasures_api = RecordingCheckErasuresAPI()
+    proc = make_processor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=erasures_api,
+    )
+
+    proc.process_phase2(request)
+
+    assert erasures_api.check_calls == ["svc-123"]
+
+
+def test_process_phase2_wraps_erasures_api_check_failures():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-2",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id="svc-123",
+    )
+    proc = make_processor(
+        repository=InMemoryRequestRepository(),
+        audit=NoOpAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=FailingCheckErasuresAPI(),
+    )
+
+    with pytest.raises(ProblemWithErasuresAPI) as exc_info:
+        proc.process_phase2(request)
+
+    assert str(exc_info.value) == "Problem checking erasures API"
+
+
+def test_process_phase2_checks_existing_erasure_status_and_runs_zendesk_erasures():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-2",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id="svc-123",
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+    audit = InMemoryAuditLogger()
+    erasures_api = RecordingCheckErasuresAPI()
+    erasures_api.responses["svc-123"] = ErasureAPIResponse(
+        "svc-123",
+        {
+            "delete-requested-data": ErasureAPITask("SUCCESS", None),
+            "DELETE_DWH_DATA": ErasureAPITask("SUCCESS", None),
+        },
+    )
+    zendesk = RecordingZendeskAPI(
+        tickets=["ticket-1", "ticket-2"],
+        users=["user-1", "user-2"],
+    )
+    proc = make_processor(
+        repository=repo,
+        audit=audit,
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=erasures_api,
+        zendesk=zendesk,
+    )
+
+    proc.process_phase2(request)
+
+    stored_request = repo.get(request.id)
+    assert stored_request is not None
+    assert request.state == "phase-3"
+    assert stored_request.state == "phase-3"
+    assert erasures_api.check_calls == ["svc-123"]
+    assert zendesk.calls == [
+        ("find_tickets", "test_id"),
+        ("delete_tickets", ["ticket-1", "ticket-2"]),
+        ("find_users", "test_id"),
+        ("delete_user", "user-1"),
+        ("delete_user", "user-2"),
+        ("purge_tickets", ["ticket-1", "ticket-2"]),
+        ("purge_user", "user-1"),
+        ("purge_user", "user-2"),
+    ]
+    assert [entry.message for entry in audit.get_logs(request.id)] == [
+        "Deleting 2 Zendesk Tickets: ticket-1,ticket-2",
+        "Deleting 2 Zendesk user(s)",
+        "Request was transitioned to phase-3",
+    ]
+
+
+def test_process_phase2_dry_run_skips_zendesk_side_effects_and_does_not_persist_transition(
+    caplog: LogCaptureFixture,
+):
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-2",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id="svc-123",
+    )
+    repo = RecordingRequestRepository()
+    repo.create(request)
+    audit = InMemoryAuditLogger()
+    erasures_api = RecordingCheckErasuresAPI()
+    erasures_api.responses["svc-123"] = ErasureAPIResponse(
+        "svc-123",
+        {
+            "delete-requested-data": ErasureAPITask("SUCCESS", None),
+            "DELETE_DWH_DATA": ErasureAPITask("SUCCESS", None),
+        },
+    )
+    zendesk = RecordingZendeskAPI(
+        tickets=["ticket-1", "ticket-2"],
+        users=["user-1", "user-2"],
+    )
+    proc = RequestProcessor(
+        repository=repo,
+        audit=audit,
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=erasures_api,
+        zendesk=zendesk,
+        dry_run=True,
+    )
+
+    with caplog.at_level("INFO", logger="dns_de_rte_orchestrator.request_processor"):
+        proc.process_phase2(request)
+
+    stored_request = repo.get(request.id)
+    assert stored_request is not None
+    assert request.state == "phase-3"
+    assert stored_request.state == "phase-2"
+    assert repo.update_calls == 0
+    assert erasures_api.check_calls == ["svc-123"]
+    assert zendesk.calls == [
+        ("find_tickets", "test_id"),
+        ("find_users", "test_id"),
+    ]
+    assert audit.get_logs(request.id) == []
+    assert (
+        "Would submit 2 deletes to Zendesk for tickets: ticket-1,ticket-2"
+        in caplog.text
+    )
+    assert "Would delete 2 users from Zendesk: user-1,user-2" in caplog.text
+    assert "Would purge Zendesk tickets: ticket-1,ticket-2" in caplog.text
+    assert "Would purge Zendesk User: user-1" in caplog.text
+    assert "Would purge Zendesk User: user-2" in caplog.text
+    assert "DryRun: Would update repository" in caplog.text
+
+
+def test_process_phase2_does_not_transition_when_erasure_status_is_incomplete():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-2",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id="svc-123",
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+    erasures_api = RecordingCheckErasuresAPI()
+    erasures_api.responses["svc-123"] = ErasureAPIResponse(
+        "svc-123",
+        {
+            "delete-requested-data": ErasureAPITask("SUCCESS", None),
+            "DELETE_DWH_DATA": ErasureAPITask("WAITING", None),
+        },
+    )
+    zendesk = RecordingZendeskAPI(
+        tickets=["ticket-1"],
+        users=["user-1"],
+    )
+    proc = make_processor(
+        repository=repo,
+        audit=InMemoryAuditLogger(),
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=erasures_api,
+        zendesk=zendesk,
+    )
+
+    proc.process_phase2(request)
+
+    stored_request = repo.get(request.id)
+    assert stored_request is not None
+    assert request.state == "phase-2"
+    assert stored_request.state == "phase-2"
+    assert zendesk.calls == []
+
+
+def test_process_phase2_logs_zendesk_failures_without_transitioning():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-2",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id="svc-123",
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+    audit = InMemoryAuditLogger()
+    erasures_api = RecordingCheckErasuresAPI()
+    erasures_api.responses["svc-123"] = ErasureAPIResponse(
+        "svc-123",
+        {
+            "delete-requested-data": ErasureAPITask("SUCCESS", None),
+            "DELETE_DWH_DATA": ErasureAPITask("SUCCESS", None),
+        },
+    )
+    zendesk = FailingZendeskAPI(
+        tickets=["ticket-1"],
+        users=["user-1"],
+    )
+    proc = make_processor(
+        repository=repo,
+        audit=audit,
+        as400=NoOpAS400Notifier(),
+        customer_api=StubCustomerAPI(),
+        erasures_api=erasures_api,
+        zendesk=zendesk,
+    )
+
+    proc.process_phase2(request)
+
+    stored_request = repo.get(request.id)
+    assert stored_request is not None
+    assert request.state == "phase-2"
+    assert stored_request.state == "phase-2"
+    assert zendesk.calls == [
+        ("find_tickets", "test_id"),
+        ("delete_tickets", ["ticket-1"]),
+        ("find_users", "test_id"),
+    ]
+    assert [entry.message for entry in audit.get_logs(request.id)] == [
+        "Deleting 1 Zendesk Tickets: ticket-1",
+        "Issue in communicating with Zendesk zendesk failed",
+    ]
+
+
+def test_process_phase3_transitions_to_done_when_customer_no_longer_exists():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-3",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id="svc-123",
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+    audit = InMemoryAuditLogger()
+    customer_api = RecordingCustomerAPI()
+    proc = make_processor(
+        repository=repo,
+        audit=audit,
+        as400=NoOpAS400Notifier(),
+        customer_api=customer_api,
+        erasures_api=StubErasuresAPI(),
+    )
+
+    proc.process_phase3(request)
+
+    stored_request = repo.get(request.id)
+    assert stored_request is not None
+    assert request.state == "done"
+    assert stored_request.state == "done"
+    assert customer_api.calls == [("test@example.com", None)]
+    assert [entry.message for entry in audit.get_logs(request.id)] == [
+        "Request was transitioned to done",
+    ]
+
+
+def test_process_phase3_moves_request_back_to_need_more_detail_when_customer_still_exists():
+    request: ErasureRequest = ErasureRequest(
+        id="test_id",
+        source="test_system",
+        state="phase-3",
+        date_issued=datetime.now(),
+        erasure_details={"email": "test@example.com"},
+        site_ids=[],
+        erasure_service_id="svc-123",
+    )
+    repo = InMemoryRequestRepository()
+    repo.create(request)
+    audit = InMemoryAuditLogger()
+    customer_api = RecordingCustomerAPI()
+    customer_api.add_results_for(
+        "test@example.com",
+        None,
+        [
+            CustomerDetails(
+                first_name="Test",
+                last_name="Customer",
+                email="test@example.com",
+                site_id=None,
+                mobile_number=None,
+                loyalty_number=None,
+                och_id=None,
+                digital_identity_id=None,
+            )
+        ],
+    )
+    proc = make_processor(
+        repository=repo,
+        audit=audit,
+        as400=NoOpAS400Notifier(),
+        customer_api=customer_api,
+        erasures_api=StubErasuresAPI(),
+    )
+
+    with pytest.raises(StillExistsAfterErasure) as exc_info:
+        proc.process_phase3(request)
+
+    stored_request = repo.get(request.id)
+    assert stored_request is not None
+    assert request.state == "need-more-detail"
+    assert stored_request.state == "need-more-detail"
+    assert customer_api.calls == [("test@example.com", None)]
+    assert str(exc_info.value) == (
+        "Customer from test_id still exists after previous erasure steps"
+    )
+    assert [entry.message for entry in audit.get_logs(request.id)] == [
+        "Request was transitioned to need-more-detail due to: Customer email still present in Customer API",
+    ]

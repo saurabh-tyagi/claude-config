@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Audit Log — {{ erasure_id }}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      background: #f5f5f5;
+      color: #212121;
+      margin: 0;
+      padding: 24px;
+    }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .subtitle { color: #666; margin: 0 0 24px; font-size: 13px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      border-radius: 6px;
+      overflow: hidden;
+      box-shadow: 0 1px 3px rgba(0,0,0,.12);
+    }
+    th {
+      background: #1565c0;
+      color: #fff;
+      text-align: left;
+      padding: 10px 14px;
+      font-weight: 600;
+      font-size: 13px;
+    }
+    td {
+      padding: 9px 14px;
+      border-bottom: 1px solid #e0e0e0;
+      vertical-align: top;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:nth-child(even) td { background: #fafafa; }
+    .ts { white-space: nowrap; color: #555; font-size: 13px; }
+    .msg { word-break: break-word; }
+    .empty, .error {
+      background: #fff;
+      border-radius: 6px;
+      padding: 32px 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.12);
+      text-align: center;
+      color: #666;
+    }
+    .error { color: #c62828; }
+  </style>
+</head>
+<body>
+  <h1>Audit Log</h1>
+  <p class="subtitle">Erasure request: <strong>{{ erasure_id }}</strong></p>
+
+  {% if error %}
+  <div class="error">
+    <strong>Error:</strong> {{ error }}
+  </div>
+  {% elif entries %}
+  <table>
+    <thead>
+      <tr>
+        <th style="width:220px">Timestamp (UTC)</th>
+        <th>Message</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for entry in entries %}
+      <tr>
+        <td class="ts">{{ entry.timestamp | format_ts }}</td>
+        <td class="msg">{{ entry.message }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No audit log entries found for this erasure request.</div>
+  {% endif %}
+</body>
+</html>

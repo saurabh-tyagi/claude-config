@@ -1,0 +1,414 @@
+# These tests are specifically for the repository using moto
+
+from collections.abc import Generator
+from datetime import datetime, timedelta
+from typing import Literal, cast
+
+import boto3
+import pytest
+from botocore.errorfactory import ClientError
+from moto import mock_aws
+from types_boto3_dynamodb.service_resource import Table
+
+from dns_de_rte_orchestrator.erasure_request import (
+    ErasureDetailKey,
+    ErasureRequest,
+    ErasureState,
+)
+from dns_de_rte_orchestrator.request_repository import DynamoDBRequestRepository
+
+TEST_TABLE_NAME: Literal["test_table"] = "test_table"
+TEST_INDEX_NAME: Literal["test_index"] = "test_index"
+
+
+@pytest.fixture
+def dynamodb_table() -> Generator[Table, None, None]:
+    with mock_aws():
+        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+        table = dynamodb.create_table(
+            TableName=TEST_TABLE_NAME,
+            KeySchema=[
+                {"AttributeName": DynamoDBRequestRepository.ID_FIELD, "KeyType": "HASH"}
+            ],
+            AttributeDefinitions=[
+                {
+                    "AttributeName": DynamoDBRequestRepository.ID_FIELD,
+                    "AttributeType": "S",
+                },
+                {
+                    "AttributeName": DynamoDBRequestRepository.STATE_FIELD,
+                    "AttributeType": "S",
+                },
+                {
+                    "AttributeName": DynamoDBRequestRepository.DATE_ISSUED_FIELD,
+                    "AttributeType": "N",
+                },
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": TEST_INDEX_NAME,
+                    "KeySchema": [
+                        {
+                            "AttributeName": DynamoDBRequestRepository.STATE_FIELD,
+                            "KeyType": "HASH",
+                        },
+                        {
+                            "AttributeName": DynamoDBRequestRepository.DATE_ISSUED_FIELD,
+                            "KeyType": "RANGE",
+                        },
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table.wait_until_exists()
+        yield table
+
+
+def build_repository() -> DynamoDBRequestRepository:
+    client = boto3.client("dynamodb", region_name="us-east-1")
+    return DynamoDBRequestRepository(
+        table_name=TEST_TABLE_NAME, index_name=TEST_INDEX_NAME, dynamodb=client
+    )
+
+
+def build_request(
+    test_id: str,
+    *,
+    time: datetime,
+    source: str = "tests",
+    state: ErasureState = "new",
+    erasure_details: dict[ErasureDetailKey, str] | None = None,
+) -> ErasureRequest:
+    return ErasureRequest(
+        id=test_id,
+        source=source,
+        date_issued=time,
+        state=state,
+        erasure_details=erasure_details or {"email": "test@email.com"},
+        site_ids=[10],
+    )
+
+
+def test_create_new_item(dynamodb_table: Table):
+    """Test creating a new item that is not in the table"""
+    test_id = "test_id"
+
+    before = dynamodb_table.get_item(Key={DynamoDBRequestRepository.ID_FIELD: test_id})
+    assert "Item" not in before, "Already exists"
+
+    repo = build_repository()
+
+    time = datetime.now()
+    request = build_request(test_id, time=time)
+
+    repo.create(request)  # should not fail
+
+    # Check it exists after
+    after = dynamodb_table.get_item(Key={DynamoDBRequestRepository.ID_FIELD: test_id})
+    assert "Item" in after
+    item = after["Item"]
+    assert item[DynamoDBRequestRepository.ID_FIELD] == test_id
+    assert item[DynamoDBRequestRepository.SOURCE_FIELD] == request.source
+    assert item[DynamoDBRequestRepository.STATE_FIELD] == request.state
+    assert (
+        item[DynamoDBRequestRepository.ERASURE_DETAILS_FIELD] == request.erasure_details
+    )
+    assert str(item[DynamoDBRequestRepository.DATE_ISSUED_FIELD]) == str(
+        request.date_issued_ms
+    )
+    assert item[DynamoDBRequestRepository.SITE_IDS_FIELD] == [10]
+
+
+def test_create_existing_item(dynamodb_table: Table):
+    """Test that creating an item that already exists errors"""
+    test_id = "test_existing_id"
+
+    time = datetime.now()
+    _ = dynamodb_table.put_item(
+        Item={
+            DynamoDBRequestRepository.ID_FIELD: test_id,
+            DynamoDBRequestRepository.SOURCE_FIELD: "tests",
+            DynamoDBRequestRepository.STATE_FIELD: "new",
+            DynamoDBRequestRepository.DATE_ISSUED_FIELD: int(time.timestamp() * 1000),
+        }
+    )
+
+    # Make sure the item is there
+    before = dynamodb_table.get_item(Key={DynamoDBRequestRepository.ID_FIELD: test_id})
+    assert "Item" in before, "Should aready exists"
+
+    repo = build_repository()
+
+    request = build_request(test_id, time=time, erasure_details={})
+
+    with pytest.raises(ClientError):
+        repo.create(request)  # should fail
+
+    # Check it exists after
+    after = dynamodb_table.get_item(Key={DynamoDBRequestRepository.ID_FIELD: test_id})
+    assert "Item" in after, "Should still exist"
+
+
+def test_create_new_item_normalizes_state_before_persisting(dynamodb_table: Table):
+    test_id = "test_normalized_state_id"
+    repo = build_repository()
+    request = build_request(test_id, time=datetime.now(), state="new")
+    # force a non standard state
+    request.state = " New "  # pyright: ignore[reportAttributeAccessIssue]
+
+    repo.create(request)
+
+    result = dynamodb_table.get_item(Key={DynamoDBRequestRepository.ID_FIELD: test_id})
+    assert "Item" in result
+    item = result["Item"]
+    assert item[DynamoDBRequestRepository.STATE_FIELD] == "new"
+
+
+def test_update_existing_item_replaces_item(dynamodb_table: Table):
+    test_id = "test_update_existing_id"
+    original_time = datetime.now()
+    original_request = build_request(test_id, time=original_time)
+    updated_time = datetime.now()
+    updated_request = build_request(
+        test_id,
+        time=updated_time,
+        source="updated-tests",
+        state="done",
+        erasure_details={"email": "updated@email.com", "rfl": "12345"},
+    )
+    repo = build_repository()
+    repo.create(original_request)
+
+    repo.update(updated_request)
+
+    result = dynamodb_table.get_item(Key={DynamoDBRequestRepository.ID_FIELD: test_id})
+    assert "Item" in result
+    item = result["Item"]
+    assert item[DynamoDBRequestRepository.ID_FIELD] == test_id
+    assert item[DynamoDBRequestRepository.SOURCE_FIELD] == "updated-tests"
+    assert item[DynamoDBRequestRepository.STATE_FIELD] == "done"
+    assert item[DynamoDBRequestRepository.ERASURE_DETAILS_FIELD] == {
+        "email": "updated@email.com",
+        "rfl": "12345",
+    }
+    assert str(item[DynamoDBRequestRepository.DATE_ISSUED_FIELD]) == str(
+        updated_request.date_issued_ms
+    )
+
+
+def test_update_missing_item_errors(dynamodb_table: Table):
+    test_id = "test_missing_update_id"
+    before = dynamodb_table.get_item(Key={DynamoDBRequestRepository.ID_FIELD: test_id})
+    assert "Item" not in before
+
+    repo = build_repository()
+    request = build_request(test_id, time=datetime.now())
+
+    with pytest.raises(ClientError):
+        repo.update(request)
+
+    after = dynamodb_table.get_item(Key={DynamoDBRequestRepository.ID_FIELD: test_id})
+    assert "Item" not in after
+
+
+def test_get_existing_item(dynamodb_table: Table):
+    test_id = "test_existing_id"
+
+    time = datetime(year=2026, month=2, day=21, hour=12, minute=35, second=20)
+    _ = dynamodb_table.put_item(
+        Item={
+            DynamoDBRequestRepository.ID_FIELD: test_id,
+            DynamoDBRequestRepository.SOURCE_FIELD: "tests",
+            DynamoDBRequestRepository.STATE_FIELD: "new",
+            DynamoDBRequestRepository.DATE_ISSUED_FIELD: int(time.timestamp() * 1000),
+            DynamoDBRequestRepository.ERASURE_DETAILS_FIELD: {"email": "foo@bar.com"},
+        }
+    )
+
+    # Make sure the item is there
+    before = dynamodb_table.get_item(Key={DynamoDBRequestRepository.ID_FIELD: test_id})
+    assert "Item" in before, "Should aready exists"
+
+    repo = build_repository()
+
+    result = repo.get(test_id)
+    assert result is not None
+
+    assert result.id == test_id
+    assert result.source == "tests"
+    assert result.state == "new"
+    assert result.date_issued == time
+    assert result.erasure_details == {"email": "foo@bar.com"}
+
+
+def test_new_then_get_item(
+    dynamodb_table: Table,  # pyright: ignore[reportUnusedParameter]
+):
+    test_id = "test_existing_id"
+
+    time = datetime(year=2026, month=2, day=21, hour=12, minute=35, second=20)
+    erasure_details: dict[ErasureDetailKey, str] = {
+        "email": "foo@bar.com",
+        "rfl": "12345",
+    }
+    site_ids = [10, 20]
+    request: ErasureRequest = ErasureRequest(
+        id=test_id,
+        source="tests",
+        state="new",
+        date_issued=time,
+        erasure_details=erasure_details,
+        site_ids=site_ids,
+    )
+
+    repo = build_repository()
+
+    repo.create(request)
+
+    result = repo.get(test_id)
+    assert result is not None
+
+    assert result.id == test_id
+    assert result.source == "tests"
+    assert result.state == "new"
+    assert result.date_issued == time
+    assert result.erasure_details == erasure_details
+    assert result.site_ids == site_ids
+
+
+def test_get_all_in_state_empty(dynamodb_table: Table):
+    assert dynamodb_table.item_count == 0, "Should be empty"
+
+    repo = build_repository()
+
+    result = repo.get_all_in_state(state="new")
+    assert len(result) == 0, "Should not have found any items"
+
+    time = datetime(year=1990, month=1, day=1, hour=12, minute=10, second=5)
+    result = repo.get_all_in_state(state="new", limit=2000, from_date=time)
+    assert len(result) == 0, "Should not have found any items"
+
+
+def test_get_all_in_state(dynamodb_table: Table):
+    assert dynamodb_table.item_count == 0, "Should be empty"
+
+    test_id = "foo"
+    time = datetime(year=2020, month=1, day=25, hour=12, minute=35, second=22)
+    erasure_details: dict[ErasureDetailKey, str] = {"email": "foo@bar.com"}
+    source = "tests"
+    state = "new"
+    _ = dynamodb_table.put_item(
+        Item={
+            DynamoDBRequestRepository.ID_FIELD: test_id,
+            DynamoDBRequestRepository.SOURCE_FIELD: source,
+            DynamoDBRequestRepository.STATE_FIELD: state,
+            DynamoDBRequestRepository.DATE_ISSUED_FIELD: int(time.timestamp() * 1000),
+            DynamoDBRequestRepository.ERASURE_DETAILS_FIELD: cast(
+                dict[str, str], erasure_details
+            ),
+        }
+    )
+
+    repo = build_repository()
+
+    result = repo.get_all_in_state(state=state)
+    assert len(result) != 0, "Should have found items"
+
+    site_ids: list[int] = []
+    expected = [
+        ErasureRequest(
+            id=test_id,
+            source=source,
+            state=state,
+            date_issued=time,
+            erasure_details=erasure_details,
+            site_ids=site_ids,
+        )
+    ]
+    assert result == expected, "Should have found item"
+
+    time_from = datetime(year=1990, month=1, day=1, hour=12, minute=10, second=5)
+    result = repo.get_all_in_state(state=state, limit=2000, from_date=time_from)
+    assert result == expected, "Should have found item within time frame"
+
+    time_from = time + timedelta(days=2)
+    result = repo.get_all_in_state(state=state, limit=20, from_date=time_from)
+    assert len(result) == 0, "Should not have found item within time frame"
+
+
+def test_get_all_in_state_paged(dynamodb_table: Table):
+    assert dynamodb_table.item_count == 0, "Should be empty"
+
+    id_prefix = "test_paged_"
+    count_to_generate = 579
+    date_issued = datetime(year=2020, month=1, day=25, hour=12, minute=35, second=22)
+    erasure_details = {"email": "foo@bar.com"}
+    source = "tests"
+    state = "new"
+
+    # Put a whole load of items into the table
+    for i in range(count_to_generate):
+        test_id = f"{id_prefix}{i}"
+        unique_date_issued = date_issued + timedelta(seconds=i)
+        _ = dynamodb_table.put_item(
+            Item={
+                DynamoDBRequestRepository.ID_FIELD: test_id,
+                DynamoDBRequestRepository.SOURCE_FIELD: source,
+                DynamoDBRequestRepository.STATE_FIELD: state,
+                DynamoDBRequestRepository.DATE_ISSUED_FIELD: int(
+                    unique_date_issued.timestamp() * 1000
+                ),
+                DynamoDBRequestRepository.ERASURE_DETAILS_FIELD: erasure_details,
+            }
+        )
+
+    repo = build_repository()
+
+    search_limit = count_to_generate + 10
+    result = repo.get_all_in_state(state=state, limit=search_limit)
+    assert len(result) == count_to_generate, "Should have found all items"
+
+    seen_ids: set[str] = set()
+    for erasure in result:
+        assert erasure.state == state, "Wrong state"
+        assert erasure.source == source, "Wrong source"
+        assert erasure.erasure_details == erasure_details, "Wrong erasure_details"
+        assert erasure.id.startswith(id_prefix), "Wrong id"
+        assert (
+            erasure.id not in seen_ids
+        ), "Should not have returned the same item multiple times"
+        seen_ids.add(erasure.id)
+
+        # Check the date is as expected, we added seconds and can infer the
+        # count from the id
+        added_seconds = int(erasure.id[len(id_prefix) :])
+        expected_date = date_issued + timedelta(seconds=added_seconds)
+        assert erasure.date_issued == expected_date, "Wrong date"
+
+    search_limit = 500
+    expected_max_date = date_issued + timedelta(seconds=search_limit)
+    result = repo.get_all_in_state(state=state, limit=search_limit)
+    assert len(result) == search_limit, f"Should have found only {search_limit} items"
+    for erasure in result:
+        assert erasure.state == state, "Wrong state"
+        assert erasure.source == source, "Wrong source"
+        assert erasure.erasure_details == erasure_details, "Wrong erasure_details"
+        assert erasure.id.startswith(id_prefix), "Wrong id"
+        assert erasure.date_issued >= date_issued
+        # Should be the first 500 entries if we've done everything in order
+        assert erasure.date_issued < expected_max_date
+
+    search_limit = count_to_generate + 10
+    search_date = date_issued + timedelta(days=20)
+    result = repo.get_all_in_state(
+        state=state, limit=search_limit, from_date=search_date
+    )
+    assert len(result) == 0, "Should not have found any items"
+
+    search_date = expected_max_date
+    result = repo.get_all_in_state(
+        state=state, limit=search_limit, from_date=search_date
+    )
+    assert len(result) == 79, "Should have found limited number of items"

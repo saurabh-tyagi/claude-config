@@ -1,0 +1,451 @@
+from datetime import datetime, timezone
+from typing import cast
+
+import pytest
+from botocore.exceptions import ClientError
+from pytest import MonkeyPatch
+from types_boto3_dynamodb.client import DynamoDBClient
+from types_boto3_dynamodb.type_defs import AttributeValueTypeDef
+
+from dns_de_rte_orchestrator.erasure_request import (
+    ErasureDetailKey,
+    ErasureRequest,
+    ErasureState,
+)
+from dns_de_rte_orchestrator.request_repository import (
+    DYNAMO_DB_INDEX_ENV_VAR,
+    DYNAMO_DB_TABLE_ENV_VAR,
+    REPOSITORY_TYPE_ENV_VAR,
+    DuplicateRequestError,
+    DynamoDBRequestRepository,
+    InMemoryRequestRepository,
+    get_dyanmodb_request_repository,
+    get_request_repository,
+)
+
+
+def make_request(
+    id: str = "req-123",
+    source: str = "test_source",
+    state: ErasureState = "new",
+    date_issued: datetime | None = None,
+    erasure_details: dict[ErasureDetailKey, str] | None = None,
+    site_ids: list[int] | None = None,
+) -> ErasureRequest:
+    if erasure_details is None:
+        erasure_details = {"email": "user@example.com"}
+
+    if date_issued is None:
+        date_issued = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    if site_ids is None:
+        site_ids = [10]
+
+    return ErasureRequest(
+        id=id,
+        source=source,
+        state=state,
+        date_issued=date_issued,
+        erasure_details=erasure_details,
+        site_ids=site_ids,
+    )
+
+
+class StubDynamoDBClient:
+    def __init__(
+        self,
+        get_item_response: dict[str, AttributeValueTypeDef] | None = None,
+    ) -> None:
+        self.get_item_response: dict[str, AttributeValueTypeDef] = (
+            get_item_response or {}
+        )
+        self.put_item_calls: list[dict[str, object]] = []
+        self.get_item_calls: list[dict[str, object]] = []
+        self.paginators: dict[str, object] = {}
+
+    def put_item(self, **kwargs: object) -> dict[str, object]:
+        self.put_item_calls.append(kwargs)
+        return {}
+
+    def get_item(self, **kwargs: object) -> dict[str, AttributeValueTypeDef]:
+        self.get_item_calls.append(kwargs)
+        return self.get_item_response
+
+    def get_paginator(self, operation_name: str) -> object:
+        return self.paginators[operation_name]
+
+
+class StubPaginator:
+    def __init__(self, pages: list[dict[str, object]]) -> None:
+        self.pages: list[dict[str, object]] = pages
+        self.paginate_calls: list[dict[str, object]] = []
+
+    def paginate(self, **kwargs: object) -> list[dict[str, object]]:
+        self.paginate_calls.append(kwargs)
+        return self.pages
+
+
+def test_in_memory_repository_create_and_get_returns_same_request():
+    repository = InMemoryRequestRepository()
+    request = make_request()
+
+    repository.create(request)
+
+    assert repository.get(request.id) is request
+
+
+def test_in_memory_repository_create_rejects_duplicate_ids():
+    repository = InMemoryRequestRepository()
+    request = make_request()
+    repository.create(request)
+
+    with pytest.raises(DuplicateRequestError) as exc_info:
+        repository.create(request)
+    assert exc_info.value.id == "req-123"
+
+
+def test_in_memory_repository_update_replaces_existing_request():
+    repository = InMemoryRequestRepository()
+    original = make_request()
+    updated = make_request(
+        id=original.id,
+        state="done",
+        erasure_details={"email": "updated@example.com"},
+    )
+    repository.create(original)
+
+    repository.update(updated)
+
+    assert repository.get(original.id) is updated
+
+
+def test_in_memory_repository_update_rejects_missing_request():
+    repository = InMemoryRequestRepository()
+
+    with pytest.raises(ValueError, match="req-123 does not already exists"):
+        repository.update(make_request())
+
+
+def test_in_memory_repository_get_all_in_state_applies_limit_and_from_date():
+    repository = InMemoryRequestRepository()
+    too_old = make_request(
+        id="req-old",
+        state="new",
+        date_issued=datetime(2023, 1, 1, 9, 0, 0, tzinfo=timezone.utc),
+    )
+    first_match = make_request(
+        id="req-1",
+        state="new",
+        date_issued=datetime(2023, 1, 1, 13, 0, 0, tzinfo=timezone.utc),
+    )
+    second_match = make_request(
+        id="req-2",
+        state="new",
+        date_issued=datetime(2023, 1, 1, 14, 0, 0, tzinfo=timezone.utc),
+    )
+    other_state = make_request(id="req-3", state="done")
+
+    for request in [too_old, first_match, second_match, other_state]:
+        repository.create(request)
+
+    results = repository.get_all_in_state(
+        "new",
+        limit=1,
+        from_date=datetime(2023, 1, 1, 12, 30, 0, tzinfo=timezone.utc),
+    )
+
+    assert results == [first_match]
+
+
+def test_dynamodb_item_from_request_serializes_request_fields():
+    request = make_request(state="new", erasure_details={"email": "user@example.com"})
+    # Force a wrong state
+    request.state = " NEW "  # pyright: ignore[reportAttributeAccessIssue]
+
+    item = DynamoDBRequestRepository.item_from_request(request)
+
+    assert item == {
+        "id": {"S": "req-123"},
+        "state": {"S": "new"},
+        "date_issued": {"N": "1672574400000"},
+        "source": {"S": "test_source"},
+        "erasure_details": {"M": {"email": {"S": "user@example.com"}}},
+        "site_ids": {"L": [{"N": "10"}]},
+    }
+
+
+def test_dynamodb_repository_create_uses_not_exists_condition():
+    client = StubDynamoDBClient()
+    repository = DynamoDBRequestRepository(
+        table_name="requests",
+        index_name="state-index",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+
+    repository.create(make_request())
+
+    assert client.put_item_calls == [
+        {
+            "TableName": "requests",
+            "Item": DynamoDBRequestRepository.item_from_request(make_request()),
+            "ReturnValues": "NONE",
+            "ConditionExpression": "attribute_not_exists(id)",
+        }
+    ]
+
+
+def test_dynamodb_repository_create_raises_duplicate_request_error_on_conditional_check_failed():
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    cast(MagicMock, client.put_item).side_effect = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": ""}}, "PutItem"
+    )
+    repository = DynamoDBRequestRepository(
+        table_name="requests",
+        index_name="state-index",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+
+    with pytest.raises(DuplicateRequestError) as exc_info:
+        repository.create(make_request())
+    assert exc_info.value.id == "req-123"
+
+
+def test_dynamodb_repository_create_propagates_other_client_errors():
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    cast(MagicMock, client.put_item).side_effect = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": ""}},
+        "PutItem",
+    )
+    repository = DynamoDBRequestRepository(
+        table_name="requests",
+        index_name="state-index",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+
+    with pytest.raises(ClientError):
+        repository.create(make_request())
+
+
+def test_dynamodb_repository_update_uses_exists_condition():
+    client = StubDynamoDBClient()
+    repository = DynamoDBRequestRepository(
+        table_name="requests",
+        index_name="state-index",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+
+    repository.update(make_request())
+
+    assert client.put_item_calls == [
+        {
+            "TableName": "requests",
+            "Item": DynamoDBRequestRepository.item_from_request(make_request()),
+            "ReturnValues": "NONE",
+            "ConditionExpression": "attribute_exists(id)",
+        }
+    ]
+
+
+def test_dynamodb_repository_get_returns_none_when_item_missing():
+    client = StubDynamoDBClient(get_item_response={})
+    repository = DynamoDBRequestRepository(
+        table_name="requests",
+        index_name="state-index",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+
+    result = repository.get("req-123")
+
+    assert result is None
+    assert client.get_item_calls == [
+        {"TableName": "requests", "Key": {"id": {"S": "req-123"}}}
+    ]
+
+
+def test_dynamodb_repository_get_all_in_state_queries_index_and_returns_requests():
+    client = StubDynamoDBClient()
+    paginator = StubPaginator(
+        pages=[
+            {},
+            {
+                "Items": [
+                    DynamoDBRequestRepository.item_from_request(
+                        make_request(id="req-1", state="new")
+                    ),
+                    DynamoDBRequestRepository.item_from_request(
+                        make_request(
+                            id="req-2",
+                            state="new",
+                            date_issued=datetime(
+                                2023, 1, 1, 13, 0, 0, tzinfo=timezone.utc
+                            ),
+                        )
+                    ),
+                ]
+            },
+        ]
+    )
+    client.paginators["query"] = paginator
+    repository = DynamoDBRequestRepository(
+        table_name="requests",
+        index_name="state-index",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+
+    results = repository.get_all_in_state("new", limit=2)
+
+    assert [request.id for request in results] == ["req-1", "req-2"]
+    assert paginator.paginate_calls == [
+        {
+            "TableName": "requests",
+            "IndexName": "state-index",
+            "Select": "ALL_ATTRIBUTES",
+            "ScanIndexForward": True,
+            "KeyConditionExpression": "#S = :state",
+            "ExpressionAttributeNames": {"#S": "state"},
+            "ExpressionAttributeValues": {":state": {"S": "new"}},
+            "PaginationConfig": {"PageSize": 2, "MaxItems": 2},
+        }
+    ]
+
+
+def test_dynamodb_repository_get_all_in_state_adds_from_date_to_query():
+    client = StubDynamoDBClient()
+    paginator = StubPaginator(
+        pages=[
+            {
+                "Items": [
+                    DynamoDBRequestRepository.item_from_request(
+                        make_request(
+                            id="req-2",
+                            state="new",
+                            date_issued=datetime(
+                                2023, 1, 1, 13, 0, 0, tzinfo=timezone.utc
+                            ),
+                        )
+                    )
+                ]
+            }
+        ]
+    )
+    client.paginators["query"] = paginator
+    repository = DynamoDBRequestRepository(
+        table_name="requests",
+        index_name="state-index",
+        dynamodb=cast(DynamoDBClient, cast(object, client)),
+    )
+    from_date = datetime(2023, 1, 1, 12, 30, 0, tzinfo=timezone.utc)
+
+    results = repository.get_all_in_state("new", limit=250, from_date=from_date)
+
+    assert [request.id for request in results] == ["req-2"]
+    assert paginator.paginate_calls == [
+        {
+            "TableName": "requests",
+            "IndexName": "state-index",
+            "Select": "ALL_ATTRIBUTES",
+            "ScanIndexForward": True,
+            "KeyConditionExpression": "#S = :state AND date_issued >= :date",
+            "ExpressionAttributeNames": {"#S": "state"},
+            "ExpressionAttributeValues": {
+                ":state": {"S": "new"},
+                ":date": {"N": "1672576200000"},
+            },
+            "PaginationConfig": {"PageSize": 100, "MaxItems": 250},
+        }
+    ]
+
+
+def test_get_dynamodb_request_repository_requires_table_env_var(
+    monkeypatch: MonkeyPatch,
+):
+    monkeypatch.delenv(DYNAMO_DB_TABLE_ENV_VAR, raising=False)
+    monkeypatch.setenv(DYNAMO_DB_INDEX_ENV_VAR, "state-index")
+
+    with pytest.raises(ValueError, match=f"{DYNAMO_DB_TABLE_ENV_VAR} was not set"):
+        _ = get_dyanmodb_request_repository()
+
+
+def test_get_dynamodb_request_repository_requires_index_env_var(
+    monkeypatch: MonkeyPatch,
+):
+    monkeypatch.setenv(DYNAMO_DB_TABLE_ENV_VAR, "requests")
+    monkeypatch.delenv(DYNAMO_DB_INDEX_ENV_VAR, raising=False)
+
+    with pytest.raises(ValueError, match=f"{DYNAMO_DB_INDEX_ENV_VAR} was not set"):
+        _ = get_dyanmodb_request_repository()
+
+
+def test_get_dynamodb_request_repository_builds_repository_from_environment(
+    monkeypatch: MonkeyPatch,
+):
+    stub_client = object()
+    monkeypatch.setenv(DYNAMO_DB_TABLE_ENV_VAR, "requests")
+    monkeypatch.setenv(DYNAMO_DB_INDEX_ENV_VAR, "state-index")
+
+    def stub_boto3_client(service_name: str) -> object:
+        assert service_name == "dynamodb"
+        return stub_client
+
+    monkeypatch.setattr(
+        "dns_de_rte_orchestrator.request_repository.boto3.client",
+        stub_boto3_client,
+    )
+
+    repository = get_dyanmodb_request_repository()
+
+    assert isinstance(repository, DynamoDBRequestRepository)
+    assert repository.table_name == "requests"
+    assert repository.index_name == "state-index"
+    assert repository.dynamodb is stub_client
+
+
+def test_get_request_repository_returns_in_memory_repository_for_memory_type(
+    monkeypatch: MonkeyPatch,
+):
+    monkeypatch.setenv(REPOSITORY_TYPE_ENV_VAR, " memory ")
+
+    repository = get_request_repository()
+
+    assert isinstance(repository, InMemoryRequestRepository)
+
+
+def test_get_request_repository_returns_dynamodb_repository_for_dynamodb_type(
+    monkeypatch: MonkeyPatch,
+):
+    expected = object()
+    monkeypatch.setenv(REPOSITORY_TYPE_ENV_VAR, " DynamoDB ")
+    monkeypatch.setattr(
+        "dns_de_rte_orchestrator.request_repository.get_dyanmodb_request_repository",
+        lambda: expected,
+    )
+
+    repository = get_request_repository()
+
+    assert repository is expected
+
+
+def test_get_request_repository_uses_default_for_blank_type(
+    monkeypatch: MonkeyPatch,
+):
+    expected = object()
+    monkeypatch.setenv(REPOSITORY_TYPE_ENV_VAR, "   ")
+    monkeypatch.setattr(
+        "dns_de_rte_orchestrator.request_repository._get_default_request_repository",
+        lambda: expected,
+    )
+
+    repository = get_request_repository()
+
+    assert repository is expected
+
+
+def test_get_request_repository_rejects_unknown_type(monkeypatch: MonkeyPatch):
+    monkeypatch.setenv(REPOSITORY_TYPE_ENV_VAR, "redis")
+
+    with pytest.raises(ValueError, match="Unknown REPOSITORY_TYPE entry: redis"):
+        _ = get_request_repository()

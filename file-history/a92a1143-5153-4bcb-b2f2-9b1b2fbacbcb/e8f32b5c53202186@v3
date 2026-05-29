@@ -1,0 +1,407 @@
+import os
+from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Literal, cast, override
+
+import boto3
+from botocore.exceptions import ClientError
+
+if TYPE_CHECKING:
+    from types_boto3_dynamodb.client import DynamoDBClient
+    from types_boto3_dynamodb.type_defs import (
+        AttributeValueTypeDef,
+        UniversalAttributeValueTypeDef,
+    )
+else:
+    DynamoDBClient = Any
+    AttributeValueTypeDef = dict[str, Any]
+    UniversalAttributeValueTypeDef = dict[str, Any]
+
+
+from dns_de_rte_orchestrator.erasure_request import ErasureRequest, ErasureState
+
+
+class DuplicateRequestError(Exception):
+    """Raised by RequestRepository.create when a request with the same id already exists."""
+
+    def __init__(self, id: str) -> None:
+        self.id: str = id
+        super().__init__(f"Erasure request with id '{id}' already exists")
+
+
+class RequestRepository(ABC):
+    """Common interface for dealing with Erasure Request storage"""
+
+    @abstractmethod
+    def create(self, request: ErasureRequest) -> None:
+        """Create a new erasure request in the underlying storage"""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def update(self, request: ErasureRequest) -> None:
+        """
+        Updates an existing item in the underlying storage based on the given request.
+
+        Note that the requests id is used to do the updating.
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get(self, id: str) -> ErasureRequest | None:
+        """Get a specific request from the underlying storage based upon its id."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_all_in_state(
+        self,
+        state: ErasureState,
+        limit: int = 100,
+        from_date: datetime | None = None,
+    ) -> list[ErasureRequest]:
+        """
+        Get the erasure requests within a given state up to a certain limit.
+
+        When the limit is reached, that many items are returned. There could be
+        more items with the given state.
+
+        You can optionally set a from_date to filter only results from that
+        given time and date until now.
+
+        Warning: This can return a lot of results if you use a terminal state.
+
+        Warning: Implementations may cap the amount of items returned under the
+        given limit if certain conditions are met. For example, DynamoDB will
+        stop returning items for a single query if the total size reaches 1 MB.
+        It is up to implementations as to how much they respect this limit.
+        For example, a DynamoDB implementation could paginate.
+
+        """
+        raise NotImplementedError()
+
+
+class InMemoryRequestRepository(RequestRepository):
+    """
+    An example implementation of a request repository.
+
+    This implementation simply stores objects in an internal dictionary.
+    It does not clone objects.
+
+    This implementation is not thread safe.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._db: dict[str, ErasureRequest] = {}
+
+    @override
+    def create(self, request: ErasureRequest) -> None:
+        if request.id in self._db:
+            raise DuplicateRequestError(request.id)
+        self._db[request.id] = request
+
+    @override
+    def update(self, request: ErasureRequest) -> None:
+        if request.id not in self._db:
+            raise ValueError(f"{request.id} does not already exists")
+        self._db[request.id] = request
+
+    @override
+    def get(self, id: str) -> ErasureRequest | None:
+        return self._db.get(id)
+
+    @override
+    def get_all_in_state(
+        self, state: ErasureState, limit: int = 100, from_date: datetime | None = None
+    ) -> list[ErasureRequest]:
+        if limit <= 0:
+            return []
+        found: list[ErasureRequest] = []
+        count: int = 0
+        for _, item in self._db.items():
+            if item.state == state:
+                if from_date is not None and item.date_issued < from_date:
+                    continue
+                found.append(item)
+                count += 1
+                if count >= limit:
+                    break
+        return found
+
+
+class DynamoDBRequestRepository(RequestRepository):
+    """DynamoDB backed repository implementation"""
+
+    ID_FIELD: Literal["id"] = "id"
+    STATE_FIELD: Literal["state"] = "state"
+    DATE_ISSUED_FIELD: Literal["date_issued"] = "date_issued"
+    SOURCE_FIELD: Literal["source"] = "source"
+    ERASURE_DETAILS_FIELD: Literal["erasure_details"] = "erasure_details"
+    SITE_IDS_FIELD: Literal["site_ids"] = "site_ids"
+    ERASURE_SERVICE_ID_FIELD: Literal["erasure_service_id"] = "erasure_service_id"
+
+    NOT_EXISTS_CONDITION: str = f"attribute_not_exists({ID_FIELD})"
+    EXISTS_CONDITION: str = f"attribute_exists({ID_FIELD})"
+
+    def __init__(
+        self, table_name: str, index_name: str, dynamodb: DynamoDBClient
+    ) -> None:
+        super().__init__()
+        self.table_name: str = table_name
+        self.index_name: str = index_name
+        self.dynamodb: DynamoDBClient = dynamodb
+
+    @override
+    def create(self, request: ErasureRequest) -> None:
+        item = self.item_from_request(request)
+        try:
+            # This should error if there is an item in the table with the given id
+            _response = self.dynamodb.put_item(
+                TableName=self.table_name,
+                Item=item,
+                ReturnValues="NONE",
+                ConditionExpression=self.NOT_EXISTS_CONDITION,
+            )
+        except ClientError as e:
+            if (
+                e.response.get("Error", {}).get("Code")
+                == "ConditionalCheckFailedException"
+            ):
+                raise DuplicateRequestError(request.id) from e
+            raise
+
+    @override
+    def update(self, request: ErasureRequest) -> None:
+        item = self.item_from_request(request)
+        # This should error if there is NOT an item in the table with the given
+        # id
+        _response = self.dynamodb.put_item(
+            TableName=self.table_name,
+            Item=item,
+            ReturnValues="NONE",
+            ConditionExpression=self.EXISTS_CONDITION,
+        )
+
+    @override
+    def get(self, id: str) -> ErasureRequest | None:
+        response = self.dynamodb.get_item(
+            TableName=self.table_name, Key={self.ID_FIELD: {"S": id}}
+        )
+
+        if "Item" in response:
+            item: dict[str, AttributeValueTypeDef] = response["Item"]
+            # Convert the item back to a domain object
+            return self.response_to_request(item)
+        else:
+            return None
+
+    @override
+    def get_all_in_state(
+        self,
+        state: ErasureState,
+        limit: int = 100,
+        from_date: datetime | None = None,
+    ) -> list[ErasureRequest]:
+        if limit <= 0:
+            return []
+        key_condition: str = "#S = :state"
+
+        #  The attribute values being used in the query
+        attribute_values: Mapping[str, UniversalAttributeValueTypeDef] = {
+            ":state": {"S": state}
+        }
+        # Replacements for attribute names that are reserved keywords
+        attribute_names: Mapping[str, str] = {"#S": "state"}
+
+        if from_date is not None:
+            # Add on the sort key condition to the key_condition
+            key_condition += " AND date_issued >= :date"
+            # Add the sort key value to attribute_values
+            timestamp = int(from_date.timestamp() * 1000)
+            attribute_values[":date"] = {"N": str(timestamp)}
+
+        paginator = self.dynamodb.get_paginator("query")
+        pages = paginator.paginate(
+            TableName=self.table_name,
+            IndexName=self.index_name,
+            Select="ALL_ATTRIBUTES",
+            ScanIndexForward=True,  # explicitly set direction of scan
+            KeyConditionExpression=key_condition,
+            ExpressionAttributeNames=attribute_names,
+            ExpressionAttributeValues=attribute_values,
+            PaginationConfig={"PageSize": min([100, limit]), "MaxItems": limit},
+        )
+
+        results: list[ErasureRequest] = []
+        for page in pages:
+            # iterate pages and add converted results to list
+            if "Items" not in page:
+                continue
+            for item in page["Items"]:
+                erasure = self.response_to_request(item)
+                results.append(erasure)
+
+        return results
+
+    @classmethod
+    def response_to_request(
+        cls, response: dict[str, AttributeValueTypeDef]
+    ) -> ErasureRequest:
+        """Convert a response dictionary to an ErasureRequest"""
+        if cls.ID_FIELD not in response:
+            raise ValueError(f"Missing {cls.ID_FIELD} field")
+        if cls.STATE_FIELD not in response:
+            raise ValueError(f"Missing {cls.STATE_FIELD} field")
+        if cls.DATE_ISSUED_FIELD not in response:
+            raise ValueError(f"Missing {cls.DATE_ISSUED_FIELD} field")
+        if cls.SOURCE_FIELD not in response:
+            raise ValueError(f"Missing {cls.SOURCE_FIELD} field")
+
+        id: str = response[cls.ID_FIELD][
+            "S"
+        ]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+        state: str = response[cls.STATE_FIELD][
+            "S"
+        ]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+        source: str = response[cls.SOURCE_FIELD][
+            "S"
+        ]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+
+        date_issued_field = response[cls.DATE_ISSUED_FIELD]
+        if "N" not in date_issued_field:
+            raise ValueError(f"Wrong type for {cls.DATE_ISSUED_FIELD}")
+        date_issued_ms = int(date_issued_field["N"])
+        date_issued: datetime = datetime.fromtimestamp(date_issued_ms / 1000)
+
+        erasure_details: dict[str, str] = {}
+        if cls.ERASURE_DETAILS_FIELD in response:
+            erasure_details_field = response[cls.ERASURE_DETAILS_FIELD]
+            if "M" in erasure_details_field:
+                returned_map = erasure_details_field["M"]
+                for k, v in returned_map.items():  # pyright: ignore[reportAny]
+                    coerced = cast(dict[str, str], v)
+                    value: str = coerced["S"]
+                    erasure_details[k] = value
+
+        site_ids: list[int] = []
+        if cls.SITE_IDS_FIELD in response:
+            site_ids_field = response[cls.SITE_IDS_FIELD]
+            if "L" in site_ids_field:
+                returned_list: Sequence[AttributeValueTypeDef] = site_ids_field["L"]
+                for item in returned_list:
+                    if "N" in item:
+                        site_id = int(item["N"])
+                        site_ids.append(site_id)
+                    else:
+                        raise ValueError(
+                            f"Wrong type inside {cls.SITE_IDS_FIELD} list: {item}"
+                        )
+
+        erasure_service_id: str | None = None
+
+        if cls.ERASURE_SERVICE_ID_FIELD in response:
+            erasure_service_id = response[cls.ERASURE_SERVICE_ID_FIELD][
+                "S"
+            ]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+
+        # TODO: Should we validate the fields afterward?
+        return ErasureRequest(
+            id=id,
+            state=state,  # pyright: ignore[reportArgumentType]
+            date_issued=date_issued,
+            source=source,
+            erasure_details=erasure_details,  # pyright: ignore[reportArgumentType],
+            site_ids=site_ids,
+            erasure_service_id=erasure_service_id,
+        )
+
+    @classmethod
+    def item_from_request(cls, request: ErasureRequest):
+        """Convert a request to a DynamoDB Item"""
+        # Build the map type
+        erasure_details: dict[str, dict[str, str]] = {}
+        for k, v in request.erasure_details.items():
+            erasure_details[k] = {"S": v}
+
+        item: dict[
+            str, dict[str, str | dict[str, dict[str, str]] | list[dict[str, str]]]
+        ] = {
+            cls.ID_FIELD: {"S": request.id},
+            cls.STATE_FIELD: {"S": request.state.strip().lower()},
+            cls.DATE_ISSUED_FIELD: {"N": str(request.date_issued_ms)},
+            cls.SOURCE_FIELD: {"S": request.source},
+            cls.ERASURE_DETAILS_FIELD: {"M": erasure_details},
+        }
+        if len(request.site_ids) > 0:
+            # Build site_ids list
+            site_ids_list: list[dict[str, str]] = []
+            for site_id in request.site_ids:
+                site_ids_list.append({"N": str(site_id)})
+            item[cls.SITE_IDS_FIELD] = {"L": site_ids_list}
+        if request.erasure_service_id is not None:
+            item[cls.ERASURE_SERVICE_ID_FIELD] = {"S": request.erasure_service_id}
+        return item
+
+
+DYNAMO_DB_TABLE_ENV_VAR: Literal["DYNAMO_DB_TABLE"] = "DYNAMO_DB_TABLE"
+"""
+Environment variable used for defining the DynamoDB table used when creating
+from the environment.
+
+When testing this variable should not be favoured, instead you should set the
+table name explicitly.
+"""
+
+DYNAMO_DB_INDEX_ENV_VAR: Literal["DYNAMO_DB_INDEX"] = "DYNAMO_DB_INDEX"
+"""
+Environment variable used for defining the DynamoDB index used when creating
+from the environment.
+
+When testing this variable should not be favoured, instead you should set the
+index name explicitly.
+"""
+
+
+def get_dyanmodb_request_repository() -> DynamoDBRequestRepository:
+    """Return a DynamoDB request repository from using environment variables"""
+
+    table_name: str | None = os.getenv(DYNAMO_DB_TABLE_ENV_VAR)
+    if table_name is None or table_name == "":
+        raise ValueError(f"{DYNAMO_DB_TABLE_ENV_VAR} was not set")
+
+    index_name: str | None = os.getenv(DYNAMO_DB_INDEX_ENV_VAR)
+    if index_name is None or index_name == "":
+        raise ValueError(f"{DYNAMO_DB_INDEX_ENV_VAR} was not set")
+
+    dynamodb: DynamoDBClient = boto3.client("dynamodb")
+    return DynamoDBRequestRepository(
+        table_name=table_name, index_name=index_name, dynamodb=dynamodb
+    )
+
+
+REPOSITORY_TYPE_ENV_VAR: Literal["REPOSITORY_TYPE"] = "REPOSITORY_TYPE"
+"""The environment variable used to force a specific repository type"""
+
+
+def get_request_repository() -> RequestRepository:
+    """Get a concrete repository via the environment variables"""
+    repo_type: str | None = os.getenv(REPOSITORY_TYPE_ENV_VAR)
+
+    match repo_type:
+        case "" | None:
+            return _get_default_request_repository()
+        case s:
+            match s.strip().lower():
+                case "dynamodb":
+                    return get_dyanmodb_request_repository()
+                case "memory":
+                    return InMemoryRequestRepository()
+                case "":
+                    return _get_default_request_repository()
+                case _:
+                    raise ValueError(f"Unknown {REPOSITORY_TYPE_ENV_VAR} entry: {s}")
+
+
+def _get_default_request_repository() -> RequestRepository:
+    """Return a default request repository, this is currently DynamoDB"""
+    return get_dyanmodb_request_repository()

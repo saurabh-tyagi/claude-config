@@ -1,0 +1,72 @@
+# Plan: Address MR !62 review comment #4 — sort entries by timestamp in `S3AuditLogWriter.write`
+
+## Context
+
+LyndonHB left an unresolved comment on `src/dns_de_rte_orchestrator/audit_logging.py:312` (now line 315 after the comment-1 refactor — the body of `S3AuditLogWriter.write`):
+
+> "Perhaps sort by timestamp so this is consistent."
+
+The reviewer's concern: `S3AuditLogWriter.write` writes entries in whatever order it receives them. Today it's only called by `AuditArchiver.archive` (`audit_logging.py:336–343`), which feeds it `DynamoDBAuditLogger.get_logs(id)` — that path uses `ScanIndexForward=True` so entries are already sorted ascending by timestamp. But:
+
+1. `S3AuditLogWriter` is a public class with no contract about input ordering. A future caller could pass unsorted entries and produce an S3 object whose JSONL lines are out of chronological order.
+2. The `AuditLogger.get_logs` interface (lines 75–83) explicitly promises "chronological order (oldest first)". `S3AuditLogReader.get_logs` reads JSONL lines verbatim with no resort — so if the writer produces unsorted output, the reader silently violates the interface contract.
+3. `InMemoryAuditLogger.get_logs` (line 121) sorts on read for the same reason — there's already precedent for treating ordering as a writer/reader-side responsibility, not a caller-side one.
+
+The intended outcome: make the S3 object self-consistent by sorting in `write`, so the on-disk format is always chronologically ordered regardless of caller. This costs O(n log n) on write (negligible for audit-log volumes) and removes a latent ordering bug if a future caller forgets to pre-sort.
+
+## Approach
+
+Sort entries by `timestamp` ascending inside `S3AuditLogWriter.write` before serialising to JSONL. Keep `S3AuditLogReader.get_logs` unchanged — it now relies on the writer guarantee.
+
+### Changes in `src/dns_de_rte_orchestrator/audit_logging.py`
+
+1. In `S3AuditLogWriter.write` (current lines 313–323), replace the JSONL line construction with a sorted version:
+   ```python
+   def write(self, id: str, entries: list[AuditEntry]) -> None:
+       key = _s3_key_for(self.prefix, id)
+       sorted_entries = sorted(entries, key=lambda e: e.timestamp)
+       lines = "\n".join(json.dumps(entry.to_json()) for entry in sorted_entries)
+       body = gzip.compress(lines.encode("utf-8"))
+       _ = self.s3.put_object(Bucket=self.bucket, Key=key, Body=body)
+       logger.info(
+           "Archived %d audit log entries to s3://%s/%s",
+           len(sorted_entries),
+           self.bucket,
+           key,
+       )
+   ```
+   `sorted()` (vs `entries.sort()`) avoids mutating the caller's list. `key=lambda e: e.timestamp` mirrors the same pattern already used by `InMemoryAuditLogger.get_logs` at line 121.
+
+2. Update the class docstring on `S3AuditLogWriter` (lines 301–306) to state the ordering guarantee:
+   ```
+   Entries are sorted by timestamp (ascending) before being written, so the
+   on-disk JSONL is always in chronological order regardless of input order.
+   ```
+
+### New / updated tests in `tests/test_audit_logging.py`
+
+The existing writer tests at lines 827–899 cover gzipping, prefixing, overwrite semantics, and error propagation — they don't probe ordering. Add one focused test alongside them:
+
+- `test_s3_writer_sorts_entries_by_timestamp_ascending` — build a list with timestamps in non-monotonic order (e.g. t=2, t=1, t=3), call `write`, parse the gzipped JSONL back, assert the timestamps come out as `[1, 2, 3]`.
+
+A second integration check is already implicitly covered by `test_write_then_read_round_trips_entries` in `tests/test_s3_audit_log_writer.py` (line 50) — but that test feeds already-sorted entries. Either add a tiny "writer sorts unsorted input" round-trip test there too, or rely on the unit test above. I'll add one to the unit-test file to keep concerns local.
+
+### Files modified
+
+- `src/dns_de_rte_orchestrator/audit_logging.py` — `S3AuditLogWriter.write` body + class docstring.
+- `tests/test_audit_logging.py` — one new test asserting sort-on-write.
+
+### Files NOT modified
+
+- `src/dns_de_rte_orchestrator/audit_logging.py: S3AuditLogReader` — reader unchanged; still reads lines verbatim. The writer guarantee makes reader-side sort unnecessary.
+- `AuditArchiver.archive` — unchanged; the DynamoDB path already returns sorted entries, so the new sort is a no-op for it.
+
+## Verification
+
+1. `uv run pytest tests/test_audit_logging.py tests/test_s3_audit_log_writer.py -q` — all writer tests including the new ordering test pass.
+2. `uv run pytest -q` — full suite green.
+3. `uv run basedpyright src/dns_de_rte_orchestrator/audit_logging.py` — no new diagnostics (sorting a `list[AuditEntry]` by `e.timestamp: datetime` is fully typed).
+
+## Out of scope
+
+The remaining 2 unresolved review comments (typed `DuplicateRequestError` in `creator_lambda.py`, README reorder) are tracked separately. Comments #1, #2, #3 are already implemented and committed.

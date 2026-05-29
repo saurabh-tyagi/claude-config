@@ -1,0 +1,121 @@
+# Plan: Teach `deep-code-reviewer` agent to flag inline-helper-extraction and cryptic-implementation opportunities
+
+## Context
+
+In the MR !62 review of this branch, LyndonHB left an unresolved comment on the inlined `BatchWriteItem` retry loop in `audit_logging.py`:
+
+> "I think this retry stuff would be best isolated a little more into its own code.
+> I am also unsure at a glance what the `time.sleep` call does. Why are we doing a left bitwise shift?"
+
+This is exactly the class of finding the in-house `deep-code-reviewer` agent (`/Users/saurabhtyagi/.claude/agents/deep-code-reviewer.md`) should have surfaced *before* the MR was opened — but the current agent prompt does not name "extract reusable inline logic into its own helper" or "replace cryptic constructs (bitshifts for arithmetic, magic numbers, dense one-liners) with self-documenting equivalents" as explicit review dimensions. They are tangentially covered under §3a (Readability) and §3k (Paradigm Adherence), but neither is concrete enough to make the agent reliably catch the bitshift-backoff anti-pattern.
+
+The intended outcome: extend the agent definition with a new explicit review dimension that catches both halves of the LyndonHB comment, anchored with the bitshift-retry example so future runs reliably surface the same issue.
+
+## Approach
+
+Use a separate **`general-purpose` sub-agent** (delegated via the `Agent` tool with `subagent_type: "general-purpose"`) to edit `/Users/saurabhtyagi/.claude/agents/deep-code-reviewer.md`. The sub-agent runs the edit in isolation, freeing the main conversation context.
+
+### Change to apply
+
+Add a new sub-section **§3m: Inline Logic Extraction and Cryptic Implementations** inside Phase 3 of the agent definition, immediately after the existing §3l (the SAM serverless-access-manager section), and *before* the `---` that introduces Phase 4.
+
+The new section must instruct the agent to flag, with concrete code-shape heuristics:
+
+1. **Extractable inline logic** — multi-step blocks (typically ≥ ~8 lines or ≥ 2 nested concerns) sitting inside a larger function that:
+   - own a distinct concern (retry, validation, serialization, parsing, transformation),
+   - would have a name if pulled out,
+   - are repeated structurally even if not byte-for-byte (e.g. two sibling retry loops with different bodies share the same retry skeleton).
+
+   Recommend extraction to a private helper method on the same class (or a module-level helper for free functions). Severity: **Medium** when the block is >10 lines or appears more than once; **Low** when shorter and unique.
+
+2. **Cryptic / dense expressions** — constructs that are technically correct but force a reader to decode:
+   - bitshifts standing in for arithmetic (`1 << n` for `2 ** n`, `x >> 1` for `x // 2`),
+   - magic numbers (`0.1`, `2`, `25`, `5`) inside expressions where named constants would carry the meaning,
+   - long chained ternaries / `min(... or ..., ...)` patterns,
+   - regex / format strings without an adjacent explanatory comment when the pattern is non-trivial,
+   - one-liners packing >2 operations (e.g. `min(0.1 * (1 << int(attempt)), 2)`).
+
+   Recommend the self-documenting equivalent: `2 ** n`, named `Final` constants, a small named helper (`_backoff_seconds(attempt)`), or a one-line docstring naming what the expression computes. Severity: **Low** for isolated cases; **Medium** when the cryptic construct sits inside critical-path or operational code (retry, security, money) where a debugger reader needs the meaning fast.
+
+3. **Debuggability lens** — the section must explicitly state that the test for both rules is *"could a tired on-call engineer read this at 3am and know what it does without running it?"* If no, propose the rewrite. This frames the rule in operational rather than aesthetic terms.
+
+The new sub-section must include a **concrete worked example** in the body, drawn directly from the MR !62 comment, in this shape:
+
+> **Example (real finding from MR !62):**
+>
+> Original:
+> ```python
+> for attempt in range(MAX_ATTEMPTS):
+>     response = client.batch_write_item(RequestItems=request_items)
+>     unprocessed = response.get("UnprocessedItems") or {}
+>     if not unprocessed:
+>         break
+>     request_items = unprocessed
+>     time.sleep(min(0.1 * (1 << int(attempt)), 2))
+> else:
+>     raise RuntimeError(...)
+> ```
+> Both extractable (the whole retry skeleton belongs in `_batch_write_with_retry`) AND cryptic (`1 << int(attempt)` is exponential backoff but reads as "bit twiddling"; `0.1` and `2` are magic).
+>
+> Improved:
+> ```python
+> BACKOFF_BASE_SECONDS: Final[float] = 0.1
+> BACKOFF_MAX_SECONDS: Final[float] = 2.0
+>
+> def _backoff_seconds(attempt: int) -> float:
+>     """Capped exponential backoff: 0.1 s, 0.2 s, 0.4 s … capped at 2 s."""
+>     return min(BACKOFF_BASE_SECONDS * (2.0 ** attempt), BACKOFF_MAX_SECONDS)
+>
+> def _batch_write_with_retry(self, request_items): ...  # owns the loop
+> ```
+
+Anchoring the section to a real, named example (rather than abstract advice) is what will make the agent reliably reproduce the LyndonHB-style finding.
+
+### Update §3a and §3k cross-references
+
+Inside §3a (Readability) and §3k (Paradigm Adherence), add a one-line cross-reference: *"For inline-helper-extraction and cryptic-construct findings see §3m."* This keeps the new section discoverable from the existing dimensions without duplicating its content.
+
+### Update the Phase 5 scorecard
+
+Add one row to the scorecard table:
+
+| Inline-logic clarity | Pass / Issues found | Count of extractable blocks and cryptic constructs |
+
+This forces the agent to explicitly answer the question on every review.
+
+### File modified
+
+- `/Users/saurabhtyagi/.claude/agents/deep-code-reviewer.md` — single file, additive changes only.
+
+### Files NOT modified
+
+- The agent's persistent memory directory (`/Users/saurabhtyagi/.claude/agent-memory/deep-code-reviewer/`) — stays empty; the new rule belongs in the prompt, not in user-scope memory, because it is universal review guidance rather than a project-specific learning.
+
+## Sub-agent delegation
+
+After this plan is approved, the main agent will invoke:
+
+```
+Agent(
+  subagent_type="general-purpose",
+  description="Update deep-code-reviewer agent prompt",
+  prompt="<self-contained brief: file path, exact section to add, exact text including the worked example, the §3a/§3k cross-references, and the scorecard row. Instruct the sub-agent to make additive Edit-tool calls only, not to rewrite the file, and to read the file once first.>"
+)
+```
+
+The sub-agent receives a fully self-contained brief and does not need conversation history.
+
+## Verification
+
+1. After the sub-agent reports done, `Read` the modified file and confirm:
+   - §3m exists between §3l and the Phase 4 separator.
+   - The worked example is verbatim (including the bitshift-vs-`2.0**attempt` contrast).
+   - §3a and §3k carry the one-line cross-reference.
+   - The Phase 5 scorecard contains the new "Inline-logic clarity" row.
+2. No other section of the file is mutated (diff should be additive). If the sub-agent rewrote the whole file, reject and re-do.
+3. Sanity-run the agent against this branch's own commits (e.g. `b993d0e`, `f1fa643`) by asking the deep-code-reviewer agent to review them — confirm it now flags the same kind of inline-retry / cryptic-bitshift pattern when it appears (or, in our case, *correctly does not flag* the now-extracted version).
+
+## Out of scope
+
+- The remaining 2 unresolved MR !62 review comments (typed `DuplicateRequestError`, README reorder).
+- Any change to the project's `CLAUDE.md` or to the in-repo code — this plan is purely about the reviewer agent's instructions.

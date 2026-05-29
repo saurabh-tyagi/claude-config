@@ -1,0 +1,124 @@
+# Plan: Fix code-review Issues 3, 4, and 5
+
+## Context
+
+The `deep-code-reviewer` surfaced three medium-severity issues in the DATA-4715 branch after the master merge:
+
+- **Issue 3**: `DYNAMO_BATCH_WRITE_MAX_ITEMS`, `DYNAMO_BATCH_WRITE_MAX_ATTEMPTS`, `BACKOFF_BASE_SECONDS`, `BACKOFF_MAX_SECONDS`, and `_backoff_seconds()` are defined at line ~352 *after* `DynamoDBAuditLogger` (line 125) which uses them. Python resolves them at call time so it works, but the reader sees the usages before the definitions — the conventional fix is to move the constants above the class.
+- **Issue 4**: All archiver tests in `test_request_processor.py` use a faked `process_phase1 → done` path. The real production trigger is `process_phase3 → done → archive`, which isn't yet implemented. The fix is a `# TODO:` comment in the archiver test block noting that a phase-3 integration test should be added once `process_phase3` transitions to `"done"`.
+- **Issue 5**: `DynamoDBAuditLogger.delete_logs` collects *all* matching keys into a Python list before issuing any `BatchWriteItem` calls, which is an unbounded materialisation. Extracting a `_query_keys_for_id(id)` helper isolates the key-fetching concern from the delete concern (consistent with `_batch_write_with_retry`), and provides the natural place to add streaming/pagination-at-deletion if needed later. However, the actual streaming fix (issue 2) is out of scope here — just the extraction.
+
+## Approach
+
+### Issue 3 — Move constants above `DynamoDBAuditLogger` (`audit_logging.py`)
+
+The four constants and the `_backoff_seconds` helper currently live at lines 352–360 (after `AuditArchiver`, which is after `DynamoDBAuditLogger`). Move the block:
+
+```python
+DYNAMO_BATCH_WRITE_MAX_ITEMS: Final[int] = 25  # AWS BatchWriteItem hard limit per call
+DYNAMO_BATCH_WRITE_MAX_ATTEMPTS: Final[int] = 5
+BACKOFF_BASE_SECONDS: Final[float] = 0.1
+BACKOFF_MAX_SECONDS: Final[float] = 2.0
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Capped exponential backoff: 0.1 s, 0.2 s, 0.4 s … capped at 2 s."""
+    return min(BACKOFF_BASE_SECONDS * (2.0**attempt), BACKOFF_MAX_SECONDS)
+```
+
+…to **immediately before** `class DynamoDBAuditLogger` (currently line 125). The `DYNAMO_DB_AUDIT_LOGGING_TABLE`, `AUDIT_LOG_S3_BUCKET`, `AUDIT_LOG_S3_PREFIX` env-var constants stay where they are (after the classes) since they don't define behaviour — they're configuration keys used by factory functions.
+
+No logic change; pure reorder.
+
+### Issue 4 — Add real phase-3 integration test (`tests/test_request_processor.py`)
+
+`process_phase3` is already fully implemented (lines 479–497 of `request_processor.py`): it checks whether the customer still appears in the Customer API, and if not it calls `self._transition_request(request, "done")`. So the real production archival path can be exercised without any monkeypatching.
+
+Add a new test `test_archiver_called_after_phase3_reaches_done` that:
+1. Seeds a `phase-3` request in an `InMemoryRequestRepository`.
+2. Uses the existing `StubCustomerAPI` (returns no results for unknown emails by default) — so `process_phase3` finds the customer gone and transitions to `"done"`.
+3. Calls `proc.process()` — no monkeypatching.
+4. Asserts `archiver_mock.archive` was called once with `"req-archive"`.
+
+The existing faked-phase-1 tests still test the archiver's conditional logic (dry-run, exception swallowing, no archiver configured). The new test locks down the actual production-path wiring. Place it as the first test in the `# --- Archiver integration via process() ---` section so it reads as the primary integration test.
+
+```python
+def test_archiver_called_after_phase3_reaches_done() -> None:
+    """Integration: process_phase3 transitions to done → archiver fires via process()."""
+    archiver_mock = _make_archiver_mock()
+    proc, repo = _build_processor(archiver=cast(AuditArchiver, archiver_mock))
+    # StubCustomerAPI returns no results by default → process_phase3 sees customer
+    # as gone and transitions to "done" without any monkeypatching.
+    request = _make_request(state="phase-3")
+    repo.create(request)
+
+    proc.process()
+
+    cast(MagicMock, archiver_mock.archive).assert_called_once_with("req-archive")
+```
+
+Note: `_make_request` produces a request with `erasure_details={"email": "test@example.com"}` — `process_phase3` checks for the email key, so no extra setup needed. `StubCustomerAPI.get_customer_details` returns `[]` for unregistered emails, which is the success path.
+
+### Issue 5 — Extract `_query_keys_for_id` helper (`audit_logging.py`)
+
+Split the key-fetching out of `delete_logs` into a private method:
+
+```python
+def _query_keys_for_id(
+    self, id: str
+) -> list[dict[str, AttributeValueTypeDef]]:
+    """Query DynamoDB for all (id, timestamp) keys for the given erasure id."""
+    paginator = self.dynamodb.get_paginator("query")
+    pages = paginator.paginate(
+        TableName=self.table_name,
+        KeyConditionExpression="#id = :id",
+        ExpressionAttributeNames={
+            "#id": AuditEntry.ID_FIELD,
+            "#ts": AuditEntry.TIMESTAMP_FIELD,
+        },
+        ExpressionAttributeValues={":id": {"S": id}},
+        ProjectionExpression="#id, #ts",
+    )
+    keys: list[dict[str, AttributeValueTypeDef]] = []
+    for page in pages:
+        for item in page.get("Items", []):
+            keys.append(
+                {
+                    AuditEntry.ID_FIELD: item[AuditEntry.ID_FIELD],
+                    AuditEntry.TIMESTAMP_FIELD: item[AuditEntry.TIMESTAMP_FIELD],
+                }
+            )
+    return keys
+```
+
+`delete_logs` becomes:
+
+```python
+def delete_logs(self, id: str) -> None:
+    """Delete all audit log entries for the given erasure id from DynamoDB."""
+    keys = self._query_keys_for_id(id)
+    for i in range(0, len(keys), DYNAMO_BATCH_WRITE_MAX_ITEMS):
+        chunk = keys[i : i + DYNAMO_BATCH_WRITE_MAX_ITEMS]
+        request_items: dict[str, list[WriteRequestTypeDef]] = {
+            self.table_name: [{"DeleteRequest": {"Key": key}} for key in chunk]
+        }
+        self._batch_write_with_retry(request_items)
+```
+
+No behaviour change. Existing tests in `tests/test_audit_logging.py` and `tests/test_dynamodb_audit_logger.py` that test `delete_logs` call the public method and do not need updating.
+
+### Files modified
+
+- `src/dns_de_rte_orchestrator/audit_logging.py` — Issues 3 and 5
+- `tests/test_request_processor.py` — Issue 4 (comment only)
+
+### Files NOT modified
+
+- Tests for `delete_logs` — behaviour unchanged, tests stay green.
+- `template.yaml`, `request_processor.py`, `README.md` — not in scope.
+
+## Verification
+
+1. `uv run pytest -q` — full suite green (no behaviour change in any of the three fixes).
+2. `uv run basedpyright src/dns_de_rte_orchestrator/audit_logging.py` — 0 errors (constants are now in scope before use; `_query_keys_for_id` return type is `list[dict[str, AttributeValueTypeDef]]`).
+3. Visual sanity: constants block now appears above `class DynamoDBAuditLogger`; `delete_logs` body is ~5 lines; archiver test block has the `# NOTE:` comment.

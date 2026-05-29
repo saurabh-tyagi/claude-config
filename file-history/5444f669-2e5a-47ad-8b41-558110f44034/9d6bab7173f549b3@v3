@@ -1,0 +1,381 @@
+# GDPR Right to Erasure Orchestration Platform
+
+[![made-with-python](https://img.shields.io/badge/Made%20with-Python-1f425f.svg)](https://www.python.org/)
+[![prek](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/j178/prek/master/docs/assets/badge-v0.json)](https://github.com/j178/prek)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![pipeline status](https://gitlab.com/HnBI/dns/dns-de-rte-orchestrator/badges/master/pipeline.svg)](https://gitlab.com/HnBI/dns/dns-de-rte-orchestrator/commits/master)
+![coverage](https://gitlab.com/HnBI/dns/dns-de-rte-orchestrator/badges/master/coverage.svg?job=test)
+
+This project was originally created to replace the
+[Tines](https://www.tines.com/) based Right to Erasure Orchestrator.
+
+## Project Goals
+
+The primary goal of this project is to replace the existing Tines based
+orchestrator for subject erasure requests in regards to the GDPR legislation.
+
+The main problems being solved are as followed:
+
+- The costs related to the use of Tines
+- The use of Jira as a point of integration and state storage
+
+This project also moves the ownership of the orchestration into the Data
+Engineering team.
+
+## API
+
+The orchestrator exposes a private REST API (deployed via AWS API Gateway and
+restricted to the configured VPC endpoint). All requests must include the
+`x-api-key` header.
+
+### `POST /erasure-request`
+
+Creates a new erasure request and queues it for processing.
+
+```sh
+curl -k -sS -X POST \
+  'https://<api-id>.execute-api.eu-west-1.amazonaws.com/prod/erasure-request' \
+  -H 'x-api-key: <api-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "id": "<unique-id>",
+    "source": "onetrust",
+    "date_issued": "2026-01-01T12:00:00+00:00",
+    "erasure_details": { "email": "user@example.com" }
+  }'
+```
+
+Required fields: `id`, `source`, `date_issued` (ISO-8601), `erasure_details`
+(object with keys from `email`, `first-name`, `last-name`, `postcode`,
+`phone-number`, `rfl`, `last-order`). Optional: `site_ids` (list of integers).
+
+| Status | Meaning |
+|--------|---------|
+| `200` | Request accepted; body is `{"id": "<id>"}` |
+| `400` | Invalid or malformed request body |
+| `409` | A request with this `id` already exists |
+| `500` | Internal error |
+
+### `GET /status/{id}`
+
+Returns the audit log entries for an erasure request, ordered chronologically
+(oldest first). Backed by `reporter_lambda`, which reads from DynamoDB and
+falls back to the materialised S3 audit log.
+
+```sh
+curl -k -sS -G \
+  'https://omqlg03jma.execute-api.eu-west-1.amazonaws.com/prod/status/<id>' \
+  -H 'x-api-key: <api-key>'
+```
+
+A `200` response has the form:
+
+```json
+{
+  "id": "<id>",
+  "entries": [
+    { "id": "<id>", "timestamp": "<iso-8601>", "message": "<text>" }
+  ]
+}
+```
+
+The endpoint returns `404` if no audit entries exist for the given id, and
+`400` if the id path parameter is missing or blank.
+
+## Audit log lifecycle
+
+Audit log entries are written to DynamoDB throughout request processing, keyed
+by `(erasure_id, timestamp_ms)`.
+
+Once a request is successfully processed and reaches the terminal `done` state,
+the process Lambda archives the complete audit log to S3 as a single gzipped
+JSON Lines object at `s3://{AUDIT_LOG_S3_BUCKET}/{AUDIT_LOG_S3_PREFIX}/{id}.jsonl.gz`,
+then deletes the DynamoDB entries for that id.
+
+The `GET /status/{id}` endpoint reads from DynamoDB first and falls back to the
+S3 archive automatically, so reads are seamless before and after archival.
+
+## Project Details
+
+This project is built using Python 3.13+ and uses
+[uv](https://docs.astral.sh/uv/) as a package manager and build tool.
+
+> [!note]
+> If you need help setting up your development environment, please refer to
+> [docs/setup-local-dev.md](/docs/setup-local-dev.md).
+
+## Development
+
+After cloning this repository you should run:
+
+```sh
+uv sync --all-groups
+uv run prek install
+```
+
+This should create a virtual environment under `.venv` in the local directory,
+download all dependencies, and install a Git pre-commit hook.
+
+Generally speaking, if you want to run a normal Python command you should
+prefix it with `uv run`.
+
+### Testing
+
+This project uses `pytest` for unit testing. These should be run using the
+following command:
+
+```sh
+uv run pytest
+```
+
+`pytest-cov` is used as an extension that can help you see how much coverage
+the tests are actually giving. You can run this as follows:
+
+```sh
+uv run pytest --cov=dns_de_rte_orchestrator
+```
+
+There isn't a set test coverage percentage code should have, but key files
+should generally have more coverage than others.
+
+### Structure
+
+The key entry points for AWS Lambda are:
+
+- `src/dns_de_rte_orchestrator/processor_lambda.py`
+- `src/dns_de_rte_orchestrator/creator_lambda.py`
+
+The storage logic sits primarily in the `RequestRepository` parent class and its
+implementations in `src/dns_de_rte_orchestrator/request_repository.py`.
+
+The business logic sits in the `RequestProcessor` class in
+`src/dns_de_rte_orchestrator/request_processor.py`.
+
+### Managing Dependencies
+
+`pip` commands should not be used to manage dependencies, instead you should
+use commands such as:
+
+```sh
+# To add a library dependency
+uv add library
+# To add a development dependency only
+uv add --dev pytest
+# To remove a dependency
+uv remove library
+```
+
+This should update the `uv.lock` file, but if in doubt you can run `uv lock`
+to regenerate it.
+
+You can attempt to upgrade packages using the following `uv` command:
+
+```sh
+uv lock --upgrade-package library
+```
+
+## Deployment
+
+The code in this project is deployed as 2 separate AWS Lambdas using [AWS
+SAM](https://aws.amazon.com/serverless/sam/).
+
+The versions of Python used during development, testing, and deployment should
+all match as closely as possible.
+
+GitLab runners are used to execute tests and deployments. The configuration for
+this is managed in `.gitlab-ci.yml`.
+
+### Process Lambda environment variables
+
+All five are wired automatically in SAM deployments via `template.yaml`
+parameters. When running locally, set them in a `.env` file at the project
+root.
+
+| Variable | Purpose |
+|---|---|
+| `DYNAMO_DB_TABLE` | Request storage table |
+| `DYNAMO_DB_INDEX` | GSI name for state-based queries |
+| `DYNAMO_DB_AUDIT_LOGGING_TABLE` | Audit log DynamoDB table |
+| `AUDIT_LOG_S3_BUCKET` | S3 bucket for materialised audit log archives |
+| `AUDIT_LOG_S3_PREFIX` | Key prefix for archive objects within the bucket |
+
+### SAM
+
+AWS SAM uses a custom `Makefile` for building the package that gets uploaded to
+AWS. This `Makefile` should not be invoked manually. The gist of it is:
+
+- It generates a `requirements.txt` with all the non-dev dependencies based on
+  the `uv.lock` file
+- It installs all these requirements into the artifact directory
+- It copies the project `src/` code into the artifact directory
+- It deletes the `requirements.txt` file
+
+The reason for the custom process is to reduce the size of the uploaded
+artifact and to keep it replicable across different AWS SAM versions.
+
+> [!note]
+> `sam local invoke` has problems when combined with the
+> [ServerlessAccessManager](https://gitlab.com/HnBI/platform-as-a-service/serverless-applications/serverless-access-manager/)
+> that the DSO team provide for us to use. You'll need to comment it out and
+> any lines that reference it in order to get `sam local invoke` to work.
+
+To do a manual deployment you'll need to do the following:
+
+```sh
+# First run the build process, this will execute the Makefile
+sam build
+# Next deploy
+sam deploy \
+  --config-file ../../samconfig.toml \
+  --config-env dev \
+  --template-file .aws-sam/build/template.yaml
+```
+
+Note that you'll need to point at the `samconfig.toml` in the project root. By
+default AWS SAM will try and search the same directory as the template file for
+the `samconfig.toml`.
+
+## Code Quality Tools
+
+This project makes use of several tools to ensure consistent code quality.
+
+You can run these tools locally alongside `pytest` by running:
+
+```sh
+./local-ci.sh
+```
+
+### prek
+
+[prek](https://prek.j178.dev/) is a replacement for the
+[pre-commit](https://pre-commit.com/) framework. Both allow you to run scripts
+and checks before a Git commit is created.
+
+`prek` is primarily used to run the other code quality tools and ensure that
+the repository remains in a high quality state.
+
+You will need to install the Git pre-commit hooks once after cloning the
+repository by running:
+
+```sh
+uv run prek install
+```
+
+This should force `prek` to run before all local commits.
+
+You can also manually run `prek` by using:
+
+```sh
+uv run prek
+```
+
+The `prek` configuration is stored in `prek.toml`. It configures many
+pre-commit checks and runs `ruff`, `basedpyright` and `black`.
+
+### ruff
+
+[ruff](https://docs.astral.sh/ruff/) is both a fast linter AND code formatter
+for Python. This project primarily uses it to lint code.
+
+You can run it via:
+
+```sh
+uv run ruff check
+```
+
+This can prevent common Python mistakes.
+
+### basedpyright
+
+[basedpyright](https://docs.basedpyright.com/latest/) is a fork of `pyright`.
+It works as a static type-checker for Python code.
+
+You should include type hints on as much code as possible to help it out and
+manage programmer expectations. You should also avoid using deprecated types
+along with the `Any` type when possible.
+
+You can manually run `basedpyright` using `uv`:
+
+```sh
+uv run basedpyright
+```
+
+Sometimes libraries may not include enough type information for `basedpyright`.
+In these instances you can create type stubs. This process can be done by hand,
+or you can try to use `basedpyright` to generate said stubs for you via a
+command like:
+
+```sh
+uv run basedpyright --createstub library
+```
+
+These stubs would be placed in the `typings/` directory at the root of the
+project.
+
+Sometimes type stubs may not be enough, in this case you can add [ignore
+comments](https://docs.basedpyright.com/latest/configuration/comments/) to the
+code.
+
+```py
+# pyright: ignore
+```
+
+You can also edit the `pyrightconfig.json` and add specific libraries to
+`allowedUntypedLibraries` to allow a whole library to be untyped.
+
+#### boto3
+
+For `boto3` type stubs there is a tool called
+[mypy_boto3_builder](https://youtype.github.io/mypy_boto3_builder/) which is
+used to generate type stubs. This is due to the fact that the `boto3` library
+is updated frequently, is large, and doesn't include good type information.
+
+These stubs can be generated by using `uvx` and `mypy-boto3-builder`, however a
+script has been provided to keep these up to date called
+`regen-boto3-type-hints.sh` that will do this for you in a consistent manner.
+You should use this script when updating the `boto3` version in
+`pyproject.toml` (and keep it pinned to a specific version) or when you want to
+add type hints for more AWS services.
+
+The type information for `boto3` is stored in the `vendored/` directory.
+
+> [!note]
+> The way Python `.whl` files work means that regenerating them will always
+> result in a different file as they contain timestamps within them. And the
+> way `uv.lock` files work is that they store a hash of the `.whl` file. This
+> is why the `vendored/` file is stored in the repository.
+
+When you refer to these types, you should use `TYPE_CHECKING` to guard their
+inclusion in your code and replace them with stub definitions. For example:
+
+```py
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from types_boto3_dynamodb.client import DynamoDBClient
+    from types_boto3_dynamodb.type_defs import (
+        AttributeValueTypeDef,
+        UniversalAttributeValueTypeDef,
+    )
+else:
+    DynamoDBClient = Any
+    AttributeValueTypeDef = dict[str, Any]
+    UniversalAttributeValueTypeDef = dict[str, Any]
+```
+
+This is because the types are not included when the Python code is packaged and
+built for AWS SAM deployments.
+
+### black
+
+[black](https://black.readthedocs.io/en/stable/) is a code formatter for
+Python.
+
+You can run `black` directly on a specific file using:
+
+```sh
+uv run black path/to/file.py
+```
+
+`black` is used to ensure all Python code follows the same standard of
+formatting.

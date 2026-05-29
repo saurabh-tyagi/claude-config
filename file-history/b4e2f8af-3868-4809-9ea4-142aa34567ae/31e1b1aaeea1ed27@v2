@@ -1,0 +1,169 @@
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import cast
+
+from aws_lambda_powertools import Logger
+from aws_lambda_powertools.tracing import Tracer
+from aws_lambda_powertools.utilities.typing import LambdaContext
+from dotenv import load_dotenv
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from dns_de_rte_orchestrator.audit_logging import (
+    AuditEntry,
+    FallbackAuditLogReader,
+    get_audit_log_reader,
+)
+
+# Load .env file, mostly useful for testing
+_ = load_dotenv()
+
+logger = Logger()
+tracer = Tracer()  # Sets service via POWERTOOLS_SERVICE_NAME env var
+
+reader: FallbackAuditLogReader = get_audit_log_reader()
+
+_TEMPLATES_DIR = Path(__file__).parent / "templates"
+_jinja_env = Environment(
+    loader=FileSystemLoader(str(_TEMPLATES_DIR)),
+    autoescape=select_autoescape(["html", "j2"]),
+)
+
+
+def _format_ts(value: datetime) -> str:
+    """Format a UTC datetime as a human-readable string for HTML display."""
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+_jinja_env.filters["format_ts"] = _format_ts
+
+_AUDIT_STATUS_TEMPLATE = _jinja_env.get_template("audit_status.html.j2")
+
+_VIEW_RESOURCE_PATH = "/status/{id}/view"
+
+
+def _response(
+    status_code: int,
+    body: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(body),
+    }
+
+
+def _html_response(status_code: int, html: str) -> dict[str, object]:
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "text/html; charset=utf-8"},
+        "body": html,
+    }
+
+
+def _is_view_request(event: dict[str, object]) -> bool:
+    """Return True when the request targets the HTML /status/{id}/view route."""
+    raw_ctx: object = event.get("requestContext")
+    if isinstance(raw_ctx, dict):
+        ctx: dict[str, object] = cast(dict[str, object], raw_ctx)
+        resource_path: object = ctx.get("resourcePath")
+        if resource_path == _VIEW_RESOURCE_PATH:
+            return True
+    # Also handle events built without a requestContext (e.g. direct invocation
+    # or simplified test events) by checking the raw path.
+    raw_path: object = event.get("path")
+    if isinstance(raw_path, str) and raw_path.endswith("/view"):
+        return True
+    return False
+
+
+def _extract_erasure_id(event: dict[str, object]) -> str | None:
+    """Extract and validate the erasure id from pathParameters.
+
+    Returns the id string, or None if absent / blank.
+    """
+    raw_params: object = event.get("pathParameters")
+    path_parameters: dict[str, object] = (  # pyright: ignore[reportUnknownVariableType]
+        raw_params if isinstance(raw_params, dict) else {}
+    )
+    erasure_id: object = path_parameters.get("id")
+    if not isinstance(erasure_id, str) or not erasure_id.strip():
+        return None
+    return erasure_id
+
+
+@tracer.capture_lambda_handler
+@logger.inject_lambda_context
+def lambda_handler(
+    event: dict[str, object],
+    _context: LambdaContext,
+) -> dict[str, object]:
+    """Entrypoint for AWS Lambda that retrieves the audit log for an erasure id.
+
+    Handles two routes:
+    - GET /status/{id}      → JSON response (existing, for programmatic callers)
+    - GET /status/{id}/view → HTML response (for browser users on the corporate VPC)
+    """
+    if _is_view_request(event):
+        return _handle_view(event)
+    return _handle_json(event)
+
+
+def _handle_json(event: dict[str, object]) -> dict[str, object]:
+    """Return the audit log as a JSON API Gateway proxy response."""
+    erasure_id = _extract_erasure_id(event)
+
+    if erasure_id is None:
+        return _response(400, {"error": "missing erasure id"})
+
+    try:
+        entries = reader.get_logs(erasure_id)
+    except Exception:
+        logger.exception("Failed to retrieve audit log for %s", erasure_id)
+        return _response(500, {"error": "internal error"})
+
+    if not entries:
+        return _response(404, {"error": "no audit log found", "id": erasure_id})
+
+    return _response(
+        200,
+        {
+            "id": erasure_id,
+            "entries": [entry.to_json() for entry in entries],
+        },
+    )
+
+
+def _handle_view(event: dict[str, object]) -> dict[str, object]:
+    """Return the audit log rendered as an HTML page."""
+    erasure_id = _extract_erasure_id(event)
+
+    if erasure_id is None:
+        html = _AUDIT_STATUS_TEMPLATE.render(
+            erasure_id="(unknown)",
+            entries=[],
+            error="Missing or invalid erasure request id.",
+        )
+        return _html_response(400, html)
+
+    try:
+        entries: list[AuditEntry] = reader.get_logs(erasure_id)
+    except Exception:
+        logger.exception("Failed to retrieve audit log for %s", erasure_id)
+        html = _AUDIT_STATUS_TEMPLATE.render(
+            erasure_id=erasure_id,
+            entries=[],
+            error=(
+                "An internal error occurred while retrieving the audit log. "
+                "Please try again later."
+            ),
+        )
+        return _html_response(500, html)
+
+    html = _AUDIT_STATUS_TEMPLATE.render(
+        erasure_id=erasure_id,
+        entries=entries,
+        error=None,
+    )
+    status_code = 200 if entries else 404
+    return _html_response(status_code, html)

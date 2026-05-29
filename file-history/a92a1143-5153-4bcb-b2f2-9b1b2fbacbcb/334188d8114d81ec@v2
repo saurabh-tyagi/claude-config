@@ -1,0 +1,166 @@
+import base64
+import json
+from datetime import datetime
+from typing import Final, cast
+
+from aws_lambda_powertools import Logger
+from aws_lambda_powertools.tracing import Tracer
+from aws_lambda_powertools.utilities.typing import LambdaContext
+from dotenv import load_dotenv
+
+from dns_de_rte_orchestrator.audit_logging import AuditLogger, get_audit_logger
+from dns_de_rte_orchestrator.dryrun import is_dry_run
+from dns_de_rte_orchestrator.erasure_request import (
+    VALID_DETAIL_KEYS,
+    ErasureDetailKey,
+    ErasureRequest,
+)
+
+from .request_repository import (
+    DuplicateRequestError,
+    RequestRepository,
+    get_request_repository,
+)
+
+# Load .env file, mostly useful for testing
+_ = load_dotenv()
+
+logger = Logger()
+tracer = Tracer()  # Sets service via POWERTOOLS_SERVICE_NAME env var
+
+in_dry_run_mode: Final[bool] = is_dry_run()
+request_repo: RequestRepository = get_request_repository()
+audit: AuditLogger = get_audit_logger()
+
+
+class InvalidRequestError(ValueError):
+    pass
+
+
+_MAX_FIELD_LEN = 512
+
+
+def _require_str(body: dict[str, object], key: str) -> str:
+    v = body[key]
+    if not isinstance(v, str) or not v:
+        raise InvalidRequestError(f"Field '{key}' must be a non-empty string")
+    if len(v) > _MAX_FIELD_LEN:
+        raise InvalidRequestError(
+            f"Field '{key}' must be <= {_MAX_FIELD_LEN} characters"
+        )
+    return v
+
+
+def request_from_event(
+    event: dict[str, object],
+) -> ErasureRequest:
+    """Convert the input event into an ErasureRequest"""
+    try:
+        raw_body: str = cast(str, event.get("body") or "")
+        if event.get("isBase64Encoded"):
+            raw_body = base64.b64decode(raw_body).decode("utf-8")
+        body: dict[str, object] = cast(dict[str, object], json.loads(raw_body))
+    except (json.JSONDecodeError, ValueError) as e:
+        raise InvalidRequestError(f"Invalid JSON body: {e}") from e
+
+    required_fields = ("id", "source", "date_issued", "erasure_details")
+    missing = [f for f in required_fields if f not in body]
+    if missing:
+        raise InvalidRequestError(f"Missing required fields: {', '.join(missing)}")
+
+    state_raw = body.get("state", "new")
+    if not isinstance(state_raw, str):
+        raise InvalidRequestError("Field 'state' must be a string")
+    if state_raw != "new":
+        raise InvalidRequestError(
+            f"Erasure requests must be created in state 'new', got '{state_raw}'"
+        )
+
+    date_issued_raw = body["date_issued"]
+    if not isinstance(date_issued_raw, str):
+        raise InvalidRequestError("Field 'date_issued' must be a string")
+    try:
+        date_issued = datetime.fromisoformat(date_issued_raw)
+    except ValueError as e:
+        raise InvalidRequestError(f"Invalid date_issued: {e}") from e
+
+    id_ = _require_str(body, "id")
+    source = _require_str(body, "source")
+
+    erasure_details_raw = body["erasure_details"]
+    if not isinstance(erasure_details_raw, dict):
+        raise InvalidRequestError("erasure_details must be an object")
+    erasure_details: dict[ErasureDetailKey, str] = {}
+    for k, v in cast(dict[str, object], erasure_details_raw).items():
+        if k not in VALID_DETAIL_KEYS:
+            raise InvalidRequestError(f"Unknown erasure_details key: '{k}'")
+        if not isinstance(v, str) or not v:
+            raise InvalidRequestError(
+                f"erasure_details['{k}'] must be a non-empty string"
+            )
+        erasure_details[k] = v  # type: ignore[literal-required]
+
+    site_ids: list[int] = []
+    if "site_ids" in body:
+        if body["site_ids"] is not None:
+            if not isinstance(body["site_ids"], list):
+                raise InvalidRequestError("site_ids must be a list")
+            site_ids_list = cast(list[object], body["site_ids"])
+            for item in site_ids_list:
+                if type(item) is not int:
+                    raise InvalidRequestError("site_ids entries must be integers")
+                site_ids.append(item)
+
+    return ErasureRequest(
+        id=id_,
+        source=source,
+        state=state_raw,
+        date_issued=date_issued,
+        erasure_details=erasure_details,
+        site_ids=site_ids,
+    )
+
+
+def _response(
+    status_code: int,
+    body: dict[str, str | int],
+) -> dict[str, object]:
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(body),
+    }
+
+
+@tracer.capture_lambda_handler
+@logger.inject_lambda_context
+def lambda_handler(
+    event: dict[str, object],
+    _context: LambdaContext,
+) -> dict[str, object]:
+    """
+    Entrypoint for AWS Lambda that does item creation.
+
+    This should be very simple, the Lambda should simply create an entry in the
+    underlying storage, another lambda or piece of compute will process them.
+    """
+    try:
+        request: ErasureRequest = request_from_event(event)
+    except (InvalidRequestError, json.JSONDecodeError) as e:
+        logger.warning("Rejecting erasure request with invalid body: %s", str(e))
+        return _response(400, {"error": "invalid request body"})
+
+    try:
+        if in_dry_run_mode:
+            logger.warning("DryRun: Would have created request for %s", request.id)
+        else:
+            request_repo.create(request)
+    except DuplicateRequestError:
+        logger.warning("Duplicate erasure request rejected: %s", request.id)
+        return _response(409, {"error": "conflict", "id": request.id})
+    except Exception:
+        logger.exception("Failed to create erasure request %s", str(request))
+        return _response(500, {"error": "internal error"})
+
+    audit.log(request.id, "Erasure request was created")
+    return _response(200, {"id": request.id})

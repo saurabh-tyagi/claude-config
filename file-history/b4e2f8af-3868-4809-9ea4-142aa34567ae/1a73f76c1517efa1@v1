@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Right to Erasure Orchestrator.
+  Originally a replacement for the Tines Orchestrator, this stack primarily
+  consists of 2 AWS Lambdas that communicate with DynamoDB
+
+Parameters:
+  Environment:
+    Description: Environment
+    Type: String
+  DynamoDBTable:
+    Description: The DynamoDB table to create new RTE requests in
+    Type: String
+  DynamoDBTableGSI:
+    Description: The DynamoDB table GSI to query for RTE requests
+    Type: String
+  AuditLogDynamoDBTable:
+    Description: The DynamoDB table to send audit logs to
+    Type: String
+  VPCEndpointId:
+    Description: VPC Endpoint ID allowed to invoke the API
+    Type: String
+  DryRunMode:
+    Description: Whether to deploy in Dry Run mode or not
+    Type: String
+  AuditLogS3Bucket:
+    Description: S3 bucket holding materialised audit logs (one .jsonl.gz per erasure id)
+    Type: String
+  AuditLogS3Prefix:
+    Description: Key prefix within the S3 bucket for materialised audit logs
+    Type: String
+
+Resources:
+  CreateServerlessAccessManager:
+    Type: Custom::ServerlessAccessManager
+    Properties:
+      ServiceToken: !Sub "arn:aws:lambda:eu-west-1:${AWS::AccountId}:function:paas-serverless-access-manager"
+      FunctionName: !Sub 'data-rte-orchestrator-create-request-${Environment}'
+      VpcExecution: "true"
+      DatadogLogging: "true"
+      Targets:
+        DynamoDBTable:
+          Type: DynamoDB
+          Properties:
+            Table: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBTable}"
+        AuditLogDynamoDBTable:
+          Type: DynamoDB
+          Properties:
+            Table: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditLogDynamoDBTable}"
+
+  CreateRequestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      OpenApiVersion: '2.0'
+      Description: !Sub "RTE orchestrator create-request API (${Environment})"
+      EndpointConfiguration:
+        Type: PRIVATE
+        VPCEndpointIds:
+          - !Ref VPCEndpointId
+      Auth:
+        ApiKeyRequired: true
+        ResourcePolicy:
+          CustomStatements:
+            - Effect: Allow
+              Action: execute-api:Invoke
+              Resource:
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*"
+              Principal: '*'
+              Condition:
+                StringEquals:
+                  aws:SourceVpce: !Ref VPCEndpointId
+
+  CreateFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !GetAtt CreateServerlessAccessManager.FunctionName
+      CodeUri: ./
+      Handler: dns_de_rte_orchestrator.creator_lambda.lambda_handler
+      Runtime: python3.13
+      Tracing: Active
+      Description: Create RTE requests
+      MemorySize: 256
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      VpcConfig: !GetAtt CreateServerlessAccessManager.VpcConfig
+      Role: !GetAtt CreateServerlessAccessManager.LambdaExecutionRoleArn
+      Environment:
+        Variables:
+          REPOSITORY_TYPE: "dynamodb"
+          DYNAMO_DB_TABLE: !Ref DynamoDBTable
+          DYNAMO_DB_INDEX: !Ref DynamoDBTableGSI
+          DYNAMO_DB_AUDIT_LOGGING_TABLE: !Ref AuditLogDynamoDBTable
+          DRY_RUN_MODE: !Ref DryRunMode
+          POWERTOOLS_SERVICE_NAME: !Sub "create-erasure-request-${Environment}"
+          # POWERTOOLS_LOGGER_LOG_EVENT must NOT be set — the incoming event
+          # contains erasure_details (PII: email, name, postcode), which
+          # should not be persisted in CloudWatch logs.
+      Events:
+        CreateErasureRequest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CreateRequestApi
+            Path: /erasure-request
+            Method: post
+            Auth:
+              ApiKeyRequired: true
+
+  CreateRequestApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    # noinspection YamlUnresolvedReferences
+    DependsOn: CreateRequestApiStage
+    Properties:
+      Name: !Sub "rte-orchestrator-api-key-${Environment}"
+      Description: !Sub "API key for OneTrust to invoke the RTE create-request API (${Environment})"
+      Enabled: true
+
+  CreateRequestUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    # noinspection YamlUnresolvedReferences
+    DependsOn: CreateRequestApiStage
+    Properties:
+      UsagePlanName: !Sub "rte-orchestrator-usage-plan-${Environment}"
+      Description: !Sub "Usage plan for the RTE create-request API (${Environment})"
+      ApiStages:
+        - ApiId: !Ref CreateRequestApi
+          Stage: !Ref Environment
+
+  CreateRequestUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref CreateRequestApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref CreateRequestUsagePlan
+
+  ProcessServerlessAccessManager:
+    Type: Custom::ServerlessAccessManager
+    Properties:
+      ServiceToken: !Sub "arn:aws:lambda:eu-west-1:${AWS::AccountId}:function:paas-serverless-access-manager"
+      FunctionName: !Sub 'data-rte-orchestrator-process-requests-${Environment}'
+      VpcExecution: "true"
+      DatadogLogging: "true"
+      Targets:
+        DynamoDBTable:
+          Type: DynamoDB
+          Properties:
+            Table: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBTable}"
+        AuditLogDynamoDBTable:
+          Type: DynamoDB
+          Properties:
+            Table: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditLogDynamoDBTable}"
+        DynamoDBIndex:
+          Type: DynamoDB
+          Properties:
+            Table: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBTable}/index/${DynamoDBTableGSI}"
+
+  ProcessFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !GetAtt ProcessServerlessAccessManager.FunctionName
+      CodeUri: ./
+      Handler: dns_de_rte_orchestrator.processor_lambda.lambda_handler
+      Runtime: python3.13
+      Tracing: Active
+      Description: Process RTE requests
+      MemorySize: 512
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      VpcConfig: !GetAtt ProcessServerlessAccessManager.VpcConfig
+      Role: !GetAtt ProcessServerlessAccessManager.LambdaExecutionRoleArn
+      Environment:
+        Variables:
+          REPOSITORY_TYPE: "dynamodb"
+          DYNAMO_DB_TABLE: !Ref DynamoDBTable
+          DYNAMO_DB_INDEX: !Ref DynamoDBTableGSI
+          DYNAMO_DB_AUDIT_LOGGING_TABLE: !Ref AuditLogDynamoDBTable
+          PROCESS_SAFETY_MARGIN_MS: "5000"
+          DRY_RUN_MODE: !Ref DryRunMode
+          CUSTOMER_API_URL: !Sub "https://customer-api-proxy-internal-eks.eu-west-1.${Environment}.hbi.systems/v1/customer/find"
+          POWERTOOLS_SERVICE_NAME: !Sub "process-erasure-requests-${Environment}"
+          # POWERTOOLS_LOGGER_LOG_EVENT must NOT be set — the incoming event
+          # contains erasure_details (PII: email, name, postcode), which
+          # should not be persisted in CloudWatch logs.
+
+  ReporterServerlessAccessManager:
+    Type: Custom::ServerlessAccessManager
+    Properties:
+      ServiceToken: !Sub "arn:aws:lambda:eu-west-1:${AWS::AccountId}:function:paas-serverless-access-manager"
+      FunctionName: !Sub 'data-rte-orchestrator-status-${Environment}'
+      VpcExecution: "true"
+      DatadogLogging: "true"
+      Targets:
+        AuditLogDynamoDBTable:
+          Type: DynamoDB
+          Properties:
+            Table: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditLogDynamoDBTable}"
+
+  ReporterS3ReadPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "rte-orchestrator-reporter-s3-read-${Environment}"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${AuditLogS3Bucket}/${AuditLogS3Prefix}/*"
+      Roles:
+        - !GetAtt ReporterServerlessAccessManager.LambdaExecutionRoleName
+
+  ReporterFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !GetAtt ReporterServerlessAccessManager.FunctionName
+      CodeUri: ./
+      Handler: dns_de_rte_orchestrator.reporter_lambda.lambda_handler
+      Runtime: python3.13
+      Tracing: Active
+      Description: Retrieve audit log for an RTE erasure request
+      MemorySize: 256
+      Timeout: 30
+      VpcConfig: !GetAtt ReporterServerlessAccessManager.VpcConfig
+      Role: !GetAtt ReporterServerlessAccessManager.LambdaExecutionRoleArn
+      Environment:
+        Variables:
+          DYNAMO_DB_AUDIT_LOGGING_TABLE: !Ref AuditLogDynamoDBTable
+          AUDIT_LOG_S3_BUCKET: !Ref AuditLogS3Bucket
+          AUDIT_LOG_S3_PREFIX: !Ref AuditLogS3Prefix
+          POWERTOOLS_SERVICE_NAME: !Sub "status-erasure-request-${Environment}"
+      Events:
+        GetErasureStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CreateRequestApi
+            Path: /status/{id}
+            Method: get
+            Auth:
+              ApiKeyRequired: true
+
+Outputs:
+  CreateRequestApiInvokeUrl:
+    Description: Invoke URL for the RTE create-request API
+    Value: !Sub "https://${CreateRequestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/erasure-request"
+  CreateRequestApiKeyId:
+    Description: ID of the API key required to invoke the RTE create-request API (retrieve value from API Gateway console)
+    Value: !Ref CreateRequestApiKey
+  GetStatusApiInvokeUrl:
+    Description: Invoke URL for the GET /status/{id} API endpoint
+    Value: !Sub "https://${CreateRequestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/status/{id}"
